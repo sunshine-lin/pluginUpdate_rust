@@ -1,4 +1,4 @@
-// 生成 AIChat Updater 图标
+// 生成 aichat Updater 图标
 const fs = require('fs');
 const path = require('path');
 

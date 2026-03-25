@@ -35,9 +35,9 @@ fn get_env() -> String {
 fn get_download_url() -> String {
     let env = get_env();
     if env == "test" {
-        "https://cj-chain-ai.cjdropshipping.offline.pre.cn/AIChat.zip".to_string()
+        "https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip".to_string()
     } else {
-        "https://chainai.cjdropshipping.cn/AIChat.zip".to_string()
+        "https://chainai.cjdropshipping.cn/aichat.zip".to_string()
     }
 }
 
@@ -45,9 +45,9 @@ fn get_download_url() -> String {
 fn get_install_path() -> PathBuf {
     let env = get_env();
     let folder_name = if env == "test" {
-        "AIChat_test"
+        "aichat_test"
     } else {
-        "AIChat"
+        "aichat"
     };
 
     if cfg!(target_os = "windows") {
@@ -95,7 +95,7 @@ async fn check_update() -> Result<CheckResult, String> {
     let download_url = get_download_url();
 
     // 尝试从 zip 同级目录获取 manifest.json 进行版本对比
-    let manifest_url = download_url.replace("AIChat.zip", "manifest.json");
+    let manifest_url = download_url.replace("aichat.zip", "manifest.json");
 
     let remote_version = match reqwest::get(&manifest_url).await {
         Ok(resp) => {
@@ -161,7 +161,7 @@ async fn perform_update() -> Result<String, String> {
     // 下载 ZIP 文件到临时目录
     let temp_dir = tempfile::tempdir()
         .map_err(|e| format!("创建临时目录失败: {}", e))?;
-    let zip_path = temp_dir.path().join("AIChat.zip");
+    let zip_path = temp_dir.path().join("aichat.zip");
 
     let response = reqwest::get(&download_url)
         .await

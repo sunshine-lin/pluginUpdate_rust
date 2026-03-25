@@ -85,7 +85,7 @@ jobs:
       - name: Zip .app for upload
         run: |
           cd src-tauri/target/release/bundle/macos
-          zip -r "AIChat-Updater-macOS.zip" *.app
+          zip -r "aichat-Updater-macOS.zip" *.app
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4

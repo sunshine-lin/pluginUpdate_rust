@@ -76,7 +76,7 @@ function App() {
   return (
     <main className="container">
       <div className="header">
-        <h1>AIChat 插件更新工具</h1>
+        <h1>aichat 插件更新工具</h1>
         <span className={`env-badge ${envClass}`}>{envLabel}</span>
       </div>
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AIChat Updater",
+  "productName": "aichat Updater",
   "version": "0.1.0",
   "identifier": "com.cjdropshipping.aichat-updater",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AIChat 插件更新工具",
+        "title": "aichat 插件更新工具",
         "width": 600,
         "height": 500,
         "resizable": true,

@@ -1,10 +1,10 @@
-# AIChat 插件更新工具
+# aichat 插件更新工具
 
-基于 Tauri (Rust + React) 的桌面应用程序，用于下载和更新 AIChat 插件。
+基于 Tauri (Rust + React) 的桌面应用程序，用于下载和更新 aichat 插件。
 
 ## 功能特点
 
-- 一键检查并更新 AIChat 插件
+- 一键检查并更新 aichat 插件
 - 自动对比本地版本与线上版本
 - 支持测试环境 (test) 和线上环境 (online) 两种模式
 - 支持 macOS 和 Windows 双平台打包
@@ -14,13 +14,13 @@
 
 | 环境 | 环境变量 | 下载地址 | 安装路径 (Windows) | 安装路径 (macOS) |
 |------|---------|---------|-------------------|-----------------|
-| 线上 (默认) | `APP_ENV=online` | https://chainai.cjdropshipping.cn/AIChat.zip | `D:\AIChat` | `~/aichat` |
-| 测试 | `APP_ENV=test` | https://cj-chain-ai.cjdropshipping.offline.pre.cn/AIChat.zip | `D:\AIChat_test` | `~/aichat_test` |
+| 线上 (默认) | `APP_ENV=online` | https://chainai.cjdropshipping.cn/aichat.zip | `D:\aichat` | `~/aichat` |
+| 测试 | `APP_ENV=test` | https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip | `D:\aichat_test` | `~/aichat_test` |
 
 ## 服务器网址
 
-- **线上环境**: https://chainai.cjdropshipping.cn/AIChat.zip
-- **测试环境**: https://cj-chain-ai.cjdropshipping.offline.pre.cn/AIChat.zip
+- **线上环境**: https://chainai.cjdropshipping.cn/aichat.zip
+- **测试环境**: https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip
 - **版本检查 (线上)**: https://chainai.cjdropshipping.cn/manifest.json
 - **版本检查 (测试)**: https://cj-chain-ai.cjdropshipping.offline.pre.cn/manifest.json
 
@@ -28,7 +28,7 @@
 
 | 操作系统 | 线上环境路径 | 测试环境路径 |
 |---------|------------|------------|
-| Windows | `D:\AIChat\` | `D:\AIChat_test\` |
+| Windows | `D:\aichat\` | `D:\aichat_test\` |
 | macOS | `~/aichat/` | `~/aichat_test/` |
 
 ## 开发环境要求
