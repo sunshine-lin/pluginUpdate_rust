@@ -58,7 +58,10 @@ fn get_install_path() -> PathBuf {
 fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     let builder = reqwest::Client::builder();
     if get_env() == "test" {
-        builder.danger_accept_invalid_certs(true).build()
+        builder
+            .danger_accept_invalid_certs(true)
+            .no_proxy() // 测试环境绕过系统代理（等同 curl --noproxy "*"）
+            .build()
     } else {
         builder.build()
     }
