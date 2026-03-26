@@ -19,48 +19,34 @@ struct CheckResult {
     install_path: String,
 }
 
-/// 获取当前环境（test 或 online）
-fn get_env() -> String {
-    option_env!("APP_ENV").unwrap_or("online").to_string()
-}
-
-/// 根据环境获取下载 URL
-fn get_download_url() -> String {
-    let env = get_env();
+/// 根据运行时环境获取下载 URL
+fn get_download_url(env: &str) -> String {
     if env == "test" {
-        "http://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip".to_string()
+        "https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip".to_string()
     } else {
         "https://chainai.cjdropshipping.cn/aichat.zip".to_string()
     }
 }
 
-/// 获取安装路径
-fn get_install_path() -> PathBuf {
-    let env = get_env();
-    let folder_name = if env == "test" {
-        "aichat_test"
-    } else {
-        "aichat"
-    };
-
+/// 根据运行时环境获取安装路径
+fn get_install_path(env: &str) -> PathBuf {
+    let folder_name = if env == "test" { "aichat_test" } else { "aichat" };
     if cfg!(target_os = "windows") {
-        PathBuf::from(format!("D:\\{}", folder_name))
+        PathBuf::from("D:\\").join(folder_name)
     } else {
-        // macOS: ~/aichat 或 ~/aichat_test
-        let mac_folder = if env == "test" { "aichat_test" } else { "aichat" };
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(mac_folder)
+            .join(folder_name)
     }
 }
 
-/// 构建 HTTP 客户端（测试环境禁用 SSL 验证）
-fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+/// 构建 HTTP 客户端（测试环境禁用 SSL 验证 + 绕过系统代理）
+fn build_http_client(env: &str) -> Result<reqwest::Client, reqwest::Error> {
     let builder = reqwest::Client::builder();
-    if get_env() == "test" {
+    if env == "test" {
         builder
             .danger_accept_invalid_certs(true)
-            .no_proxy() // 测试环境绕过系统代理（等同 curl --noproxy "*"）
+            .no_proxy() // 绕过系统代理（等同 curl --noproxy "*"）
             .build()
     } else {
         builder.build()
@@ -87,30 +73,28 @@ fn get_local_version(install_path: &PathBuf) -> String {
     "0.0.0".to_string()
 }
 
-/// 获取应用信息
+/// 获取应用信息（运行时传入环境参数）
 #[tauri::command]
-fn get_app_info() -> UpdateInfo {
-    let install_path = get_install_path();
+fn get_app_info(env: String) -> UpdateInfo {
+    let install_path = get_install_path(&env);
     let current_version = get_local_version(&install_path);
     UpdateInfo {
         install_path: install_path.to_string_lossy().to_string(),
         current_version,
-        env: get_env(),
-        download_url: get_download_url(),
+        download_url: get_download_url(&env),
+        env,
     }
 }
 
 /// 检查更新（对比本地与远程版本）
 #[tauri::command]
-async fn check_update() -> Result<CheckResult, String> {
-    let install_path = get_install_path();
+async fn check_update(env: String) -> Result<CheckResult, String> {
+    let install_path = get_install_path(&env);
     let current_version = get_local_version(&install_path);
-    let download_url = get_download_url();
-
-    // 尝试从 zip 同级目录获取 manifest.json 进行版本对比
+    let download_url = get_download_url(&env);
     let manifest_url = download_url.replace("aichat.zip", "manifest.json");
 
-    let client = build_http_client().map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+    let client = build_http_client(&env).map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
 
     let remote_version = match client.get(&manifest_url).send().await {
         Ok(resp) => {
@@ -162,20 +146,18 @@ fn version_compare(remote: &str, local: &str) -> bool {
 
 /// 执行更新：下载 ZIP 并解压到安装路径
 #[tauri::command]
-async fn perform_update() -> Result<String, String> {
-    let install_path = get_install_path();
-    let download_url = get_download_url();
+async fn perform_update(env: String) -> Result<String, String> {
+    let install_path = get_install_path(&env);
+    let download_url = get_download_url(&env);
 
-    // 创建安装目录
     fs::create_dir_all(&install_path)
         .map_err(|e| format!("创建目录失败: {}", e))?;
 
-    // 下载 ZIP 文件到临时目录
     let temp_dir = tempfile::tempdir()
         .map_err(|e| format!("创建临时目录失败: {}", e))?;
     let zip_path = temp_dir.path().join("aichat.zip");
 
-    let client = build_http_client().map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+    let client = build_http_client(&env).map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
 
     let response = client
         .get(&download_url)
@@ -195,7 +177,6 @@ async fn perform_update() -> Result<String, String> {
     fs::write(&zip_path, &bytes)
         .map_err(|e| format!("保存ZIP文件失败: {}", e))?;
 
-    // 解压 ZIP 文件
     let file = fs::File::open(&zip_path)
         .map_err(|e| format!("打开ZIP文件失败: {}", e))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -207,7 +188,6 @@ async fn perform_update() -> Result<String, String> {
             .map_err(|e| format!("读取ZIP条目失败: {}", e))?;
 
         let file_name = file.name().to_string();
-        // 安全检查：防止路径穿越
         if file_name.contains("..") {
             continue;
         }

@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
+type Env = "online" | "test";
+
 interface UpdateInfo {
   install_path: string;
   current_version: string;
@@ -17,6 +19,7 @@ interface CheckResult {
 }
 
 function App() {
+  const [activeEnv, setActiveEnv] = useState<Env>("online");
   const [appInfo, setAppInfo] = useState<UpdateInfo | null>(null);
   const [status, setStatus] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
@@ -24,12 +27,16 @@ function App() {
   const [checkResult, setCheckResult] = useState<CheckResult | null>(null);
 
   useEffect(() => {
-    loadAppInfo();
-  }, []);
+    setStatus("");
+    setShowConfirm(false);
+    setCheckResult(null);
+    setAppInfo(null);
+    loadAppInfo(activeEnv);
+  }, [activeEnv]);
 
-  async function loadAppInfo() {
+  async function loadAppInfo(env: Env) {
     try {
-      const info = await invoke<UpdateInfo>("get_app_info");
+      const info = await invoke<UpdateInfo>("get_app_info", { env });
       setAppInfo(info);
     } catch (e) {
       setStatus(`获取信息失败: ${e}`);
@@ -40,7 +47,7 @@ function App() {
     setLoading(true);
     setStatus("正在检查更新...");
     try {
-      const result = await invoke<CheckResult>("check_update");
+      const result = await invoke<CheckResult>("check_update", { env: activeEnv });
       setCheckResult(result);
       if (result.has_update) {
         setStatus(`发现新版本: ${result.remote_version}（当前: ${result.current_version}）`);
@@ -60,9 +67,9 @@ function App() {
     setLoading(true);
     setStatus("正在下载并安装更新，请稍候...");
     try {
-      const result = await invoke<string>("perform_update");
+      const result = await invoke<string>("perform_update", { env: activeEnv });
       setStatus(result);
-      await loadAppInfo();
+      await loadAppInfo(activeEnv);
     } catch (e) {
       setStatus(`更新失败: ${e}`);
     } finally {
@@ -70,24 +77,33 @@ function App() {
     }
   }
 
-  const envLabel = appInfo?.env === "test" ? "测试环境" : "线上环境";
-  const envClass = appInfo?.env === "test" ? "env-test" : "env-online";
-
   return (
     <main className="container">
       <div className="header">
         <h1>aichat 插件更新工具</h1>
-        <span className={`env-badge ${envClass}`}>{envLabel}</span>
+      </div>
+
+      <div className="env-tabs">
+        <button
+          className={`tab-btn ${activeEnv === "online" ? "tab-active tab-online" : ""}`}
+          onClick={() => !loading && setActiveEnv("online")}
+          disabled={loading}
+        >
+          线上环境
+        </button>
+        <button
+          className={`tab-btn ${activeEnv === "test" ? "tab-active tab-test" : ""}`}
+          onClick={() => !loading && setActiveEnv("test")}
+          disabled={loading}
+        >
+          测试环境
+        </button>
       </div>
 
       <div className="info-card">
         <div className="info-row">
-          <span className="label">当前环境:</span>
-          <span className="value">{envLabel}</span>
-        </div>
-        <div className="info-row">
           <span className="label">当前版本:</span>
-          <span className="value">{appInfo?.current_version || "加载中..."}</span>
+          <span className="value">{appInfo?.current_version || "加载中..."}  </span>
         </div>
         <div className="info-row">
           <span className="label">安装路径:</span>
