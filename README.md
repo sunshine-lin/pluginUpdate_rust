@@ -6,17 +6,18 @@
 
 - 一键检查并更新 aichat 插件
 - 自动对比本地版本与线上版本
-- 支持测试环境 (test) 和线上环境 (online) 两种模式，**测试包名与正式包名不同**
-- 测试环境自动禁用 SSL 证书验证，兼容内网 HTTPS 地址
+- 单安装包支持两种环境：线上 (online) 与测试 (test)
+- 顶部 Tab 运行时切换环境，无需重新安装不同版本客户端
+- 测试环境自动禁用 SSL 证书验证并绕过系统代理，兼容内网 HTTPS 地址
 - 支持 macOS 和 Windows 双平台打包
 - 自动下载 ZIP 并解压到指定安装路径
 
-## 环境变量
+## 环境与地址
 
-| 环境 | 环境变量 | 下载地址 | 安装路径 (Windows) | 安装路径 (macOS) |
-|------|---------|---------|-------------------|-----------------|
-| 线上 (默认) | `APP_ENV=online` | https://chainai.cjdropshipping.cn/aichat.zip | `D:\aichat` | `~/aichat` |
-| 测试 | `APP_ENV=test` | https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip | `D:\aichat_test` | `~/aichat_test` |
+| 环境 | 下载地址 | 安装路径 (Windows) | 安装路径 (macOS) |
+|------|---------|-------------------|-----------------|
+| 线上 | https://chainai.cjdropshipping.cn/aichat.zip | `D:\aichat` | `~/aichat` |
+| 测试 | https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip | `D:\aichat_test` | `~/aichat_test` |
 
 ## 服务器网址
 
@@ -49,35 +50,15 @@ npm install
 ### 开发模式
 
 ```bash
-# 线上环境(默认)
 npm run tauri dev
-
-# 测试环境
-APP_ENV=test npm run tauri dev
 ```
 
 ### 打包构建
 
-推荐使用封装好的脚本，自动区分包名和 SSL 设置：
-
-#### macOS 打包
+统一构建一个安装包，运行时通过顶部 Tab 切换线上/测试环境：
 
 ```bash
-# 线上环境 (productName: aichat Updater)
-npm run build:online
-
-# 测试环境 (productName: aichat Updater Test，禁用 SSL 验证)
-npm run build:test
-```
-
-#### Windows 打包 (需在 Windows 系统执行)
-
-```bat
-REM 线上环境
-npm run build:online
-
-REM 测试环境
-set APP_ENV=test && npm run build && tauri build --config src-tauri/tauri.test.conf.json
+npm run tauri build
 ```
 
 ### 打包输出
@@ -88,10 +69,10 @@ set APP_ENV=test && npm run build && tauri build --config src-tauri/tauri.test.c
 
 ## 使用说明
 
-1. 启动应用后，界面会显示当前环境、版本号和安装路径
+1. 启动应用后，在顶部 Tab 选择目标环境（线上/测试）
 2. 点击 **"🔄 立即检查更新"** 按钮检查是否有新版本
-3. 如果有新版本，会弹出确认框，点击"确定更新"开始下载安装
-4. 更新完成后会自动刷新版本信息
+3. 如果有新版本，会弹出确认框，点击“确定更新”开始下载安装
+4. 更新完成后会自动刷新当前 Tab 对应环境的版本信息
 
 ## 项目结构
 
