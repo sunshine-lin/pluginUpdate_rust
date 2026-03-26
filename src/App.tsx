@@ -46,7 +46,7 @@ function App() {
         setStatus(`发现新版本: ${result.remote_version}（当前: ${result.current_version}）`);
         setShowConfirm(true);
       } else {
-        setStatus(`当前已是最新版本 (${result.current_version})，无需更新`);
+        setStatus(`当前已是最新版本，无需更新（本地: ${result.current_version}，线上: ${result.remote_version}）`);
       }
     } catch (e) {
       setStatus(`检查更新失败: ${e}`);

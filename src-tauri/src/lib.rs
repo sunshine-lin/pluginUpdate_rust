@@ -3,13 +3,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Manifest {
-    version: String,
-    #[serde(flatten)]
-    other: serde_json::Value,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateInfo {
     install_path: String,
@@ -71,13 +64,20 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     }
 }
 
+/// 从 JSON 文本中提取 version 字段
+fn extract_version(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(|s| s.to_string()))
+}
+
 /// 读取本地 manifest.json 的版本号
 fn get_local_version(install_path: &PathBuf) -> String {
     let manifest_path = install_path.join("manifest.json");
     if manifest_path.exists() {
         if let Ok(content) = fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-                return manifest.version;
+            if let Some(version) = extract_version(&content) {
+                return version;
             }
         }
     }
@@ -114,15 +114,12 @@ async fn check_update() -> Result<CheckResult, String> {
             if resp.status().is_success() {
                 match resp.text().await {
                     Ok(text) => {
-                        match serde_json::from_str::<Manifest>(&text) {
-                            Ok(manifest) => manifest.version,
-                            Err(_) => "0.0.1".to_string(),
-                        }
-                    }
-                    Err(_) => "0.0.1".to_string(),
+                        extract_version(&text)
+                            .ok_or_else(|| format!("manifest.json 中未找到 version 字段，响应内容片段: {}", &text[..text.len().min(200)]))?                    }
+                    Err(e) => return Err(format!("读取响应内容失败: {}", e)),
                 }
             } else {
-                "0.0.1".to_string()
+                return Err(format!("获取 manifest 失败，HTTP状态码: {}", resp.status()));
             }
         }
         Err(e) => return Err(format!("网络请求失败: {}", e)),
