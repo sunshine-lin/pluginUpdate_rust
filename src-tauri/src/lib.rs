@@ -35,7 +35,7 @@ fn get_env() -> String {
 fn get_download_url() -> String {
     let env = get_env();
     if env == "test" {
-        "https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip".to_string()
+        "http://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip".to_string()
     } else {
         "https://chainai.cjdropshipping.cn/aichat.zip".to_string()
     }
@@ -58,6 +58,16 @@ fn get_install_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(mac_folder)
+    }
+}
+
+/// 构建 HTTP 客户端（测试环境禁用 SSL 验证）
+fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    let builder = reqwest::Client::builder();
+    if get_env() == "test" {
+        builder.danger_accept_invalid_certs(true).build()
+    } else {
+        builder.build()
     }
 }
 
@@ -97,7 +107,9 @@ async fn check_update() -> Result<CheckResult, String> {
     // 尝试从 zip 同级目录获取 manifest.json 进行版本对比
     let manifest_url = download_url.replace("aichat.zip", "manifest.json");
 
-    let remote_version = match reqwest::get(&manifest_url).await {
+    let client = build_http_client().map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+
+    let remote_version = match client.get(&manifest_url).send().await {
         Ok(resp) => {
             if resp.status().is_success() {
                 match resp.text().await {
@@ -163,7 +175,11 @@ async fn perform_update() -> Result<String, String> {
         .map_err(|e| format!("创建临时目录失败: {}", e))?;
     let zip_path = temp_dir.path().join("aichat.zip");
 
-    let response = reqwest::get(&download_url)
+    let client = build_http_client().map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+
+    let response = client
+        .get(&download_url)
+        .send()
         .await
         .map_err(|e| format!("下载失败: {}", e))?;
 

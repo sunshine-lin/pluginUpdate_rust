@@ -6,7 +6,8 @@
 
 - 一键检查并更新 aichat 插件
 - 自动对比本地版本与线上版本
-- 支持测试环境 (test) 和线上环境 (online) 两种模式
+- 支持测试环境 (test) 和线上环境 (online) 两种模式，**测试包名与正式包名不同**
+- 测试环境自动禁用 SSL 证书验证，兼容内网 HTTPS 地址
 - 支持 macOS 和 Windows 双平台打包
 - 自动下载 ZIP 并解压到指定安装路径
 
@@ -57,26 +58,26 @@ APP_ENV=test npm run tauri dev
 
 ### 打包构建
 
+推荐使用封装好的脚本，自动区分包名和 SSL 设置：
+
 #### macOS 打包
 
 ```bash
-# 线上环境
-npm run tauri build
+# 线上环境 (productName: aichat Updater)
+npm run build:online
 
-# 测试环境
-APP_ENV=test npm run tauri build
+# 测试环境 (productName: aichat Updater Test，禁用 SSL 验证)
+npm run build:test
 ```
 
-#### Windows 打包 (交叉编译)
+#### Windows 打包 (需在 Windows 系统执行)
 
-需要在 Windows 系统上执行：
+```bat
+REM 线上环境
+npm run build:online
 
-```bash
-# 线上环境
-npm run tauri build
-
-# 测试环境
-set APP_ENV=test && npm run tauri build
+REM 测试环境
+set APP_ENV=test && npm run build && tauri build --config src-tauri/tauri.test.conf.json
 ```
 
 ### 打包输出

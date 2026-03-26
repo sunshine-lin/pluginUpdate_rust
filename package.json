@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:online": "npm run build && tauri build",
+    "build:test": "npm run build && APP_ENV=test tauri build --config src-tauri/tauri.test.conf.json"
   },
   "dependencies": {
     "react": "^19.1.0",
