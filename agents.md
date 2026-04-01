@@ -47,6 +47,44 @@
 
 🛑**26年4月1日 10:22:00 第1次补充已完成**
 
+# 26年4月1日 10:57:08 ，第2次补充
+👨‍💻**提交人：shengxia**
+## 规划任务:
+### 可行性分析：Tauri 集成 RPA 操控 Chrome 扩展侧边栏
+### Rust 后端：新增 open_chrome_sidebar 命令（macOS AppleScript/Windows PowerShell）
+### 前端 UI：新增「打开 aichat 侧边栏」按钮 + 扩展 ID 输入配置
+### 编写 TDD 测试用例（命令构建逻辑、平台分支）
+### 更新 README & 提交 Commit
+### askQuestions 补充需求
+1. 需要实现以下两个需求：
+  - 点击更新后 需要实现所有谷歌浏览器刷新
+  - 接着 通过RPA的方式 实现点击谷歌浏览器的插件的图标 使得 可以实现自动打开插件侧边栏
+2. 分析下上述需求如何实现，可行性跟方式是什么？
+
+## 可行性分析：
+**需求1（刷新所有Chrome标签页）：**
+- macOS：`osascript` AppleScript `tell application "Google Chrome" to reload every tab of every window` ✅ 可行
+- Windows：PowerShell `Shell.Application` + 发送 F5 键至 Chrome 窗口 ✅ 可行
+
+**需求2（RPA打开侧边栏）：**
+- 直接打开 URL `chrome-extension://<id>/sidepanel.html` 即可触发 Side Panel 展开 ✅ 已实现
+- "点击图标" 方式依赖屏幕坐标不稳定，不推荐
+
+**实现方案：**
+- 新增 Rust 命令 `refresh_chrome_tabs`（macOS AppleScript / Windows PowerShell）
+- `perform_update` 完成后前端自动依次调用：`refresh_chrome_tabs` → `open_chrome_sidebar`（已配置扩展ID时）
+
+# 26年4月1日 11:35:54 ，第2次补充（补充需求重新规划）
+👨‍💻**提交人：shengxia**
+## 规划任务:
+### TDD先行：新增 refresh_chrome_tabs 测试用例
+### Rust后端：新增 refresh_chrome_tabs 命令（刷新所有Chrome标签页）
+### 前端：更新完成后自动调用 refresh_chrome_tabs + open_chrome_sidebar
+### 运行全量测试验证
+### 执行 npm run tauri build 验证打包
+### 更新 README & 提交 Commit
+### askQuestions 补充需求
+
 # 每次运行的结果插入到本段前面，需求3次补充以后的内容插入到本行前面，以下为每次阅读时候都要确认没有遗忘的规则要求：
 1、每次文档更新需要遵循TDD开发模式及本文档`系统级要求`要求重新规划完成任务；2、规划最后一个任务必须是使用askQuestions工具要求我补充需求（首选项：阅读 ${当前文档路径} 完成补充任务，如果用户选择此项表示用户在当前文档补充了新需求，需要按照要求重新读取文档内容，如果没有在尾部读取到新内容可能用户未保存，需重新调用askQuestions工具询问，检查遗漏未完成的任务使用Multi-select模式列出建议的后续任务），检查任务完整性不得跳过。3、允许直接操作本地的软件和git管理的代码，注意操作远程会有修改、删除数据效果并且不可撤销的操作必须先写入完整的操作方案，然后调用askQuestions工具Multi-select模式询问，确认后按照方案操作。4、当出现纠正的时候需要在修改的每个代码文件、方法前面按照规范写入注意事项注释说明，比如java代码需要遵循java doc注释规范，js代码需要遵循js doc注释规范；阅读代码时需要注意这些注释说明，理解修改的原因和目的；5、及时清理掉无用的文件，无用的日志文件，临时文件保存到tmp目录；6、注意检查保密、密钥等信息不要加入git管理，如果存在提示我需要删除；每次修改需要及时更新README文件；
 

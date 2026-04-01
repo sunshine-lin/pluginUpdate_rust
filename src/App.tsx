@@ -29,6 +29,10 @@ function App() {
   // 路径编辑状态
   const [editingPath, setEditingPath] = useState<boolean>(false);
   const [customPathInput, setCustomPathInput] = useState<string>("");
+  // Chrome 扩展 ID 配置状态
+  const [extensionId, setExtensionId] = useState<string>("");
+  const [editingExtId, setEditingExtId] = useState<boolean>(false);
+  const [extIdInput, setExtIdInput] = useState<string>("");
 
   useEffect(() => {
     setStatus("");
@@ -38,6 +42,13 @@ function App() {
     setEditingPath(false);
     loadAppInfo(activeEnv);
   }, [activeEnv]);
+
+  // 加载扩展 ID（只在首次挂载时执行一次）
+  useEffect(() => {
+    invoke<string | null>("get_extension_id").then((id) => {
+      if (id) setExtensionId(id);
+    });
+  }, []);
 
   async function loadAppInfo(env: Env) {
     try {
@@ -89,6 +100,51 @@ function App() {
     setCustomPathInput("");
   }
 
+  /** 进入扩展 ID 编辑状态 */
+  function handleEditExtId() {
+    setExtIdInput(extensionId);
+    setEditingExtId(true);
+  }
+
+  /** 保存 Chrome 扩展 ID */
+  async function handleSaveExtId() {
+    const trimmed = extIdInput.trim();
+    if (!trimmed) {
+      setStatus("扩展ID不能为空");
+      return;
+    }
+    if (!/^[a-p]{32}$/.test(trimmed)) {
+      setStatus("扩展ID格式无效，应为32位 a-p 小写字母");
+      return;
+    }
+    try {
+      await invoke("save_extension_id", { id: trimmed });
+      setExtensionId(trimmed);
+      setEditingExtId(false);
+      setStatus("扩展 ID 已保存");
+    } catch (e) {
+      setStatus(`保存扩展ID失败: ${e}`);
+    }
+  }
+
+  /** 通过 RPA 打开 Chrome 扩展侧边栏 */
+  async function handleOpenSidebar() {
+    if (!extensionId) {
+      setStatus("请先配置 Chrome 扩展 ID");
+      return;
+    }
+    setLoading(true);
+    setStatus("正在打开 Chrome 扩展侧边栏...");
+    try {
+      const result = await invoke<string>("open_chrome_sidebar", { extensionId });
+      setStatus(result);
+    } catch (e) {
+      setStatus(`打开侧边栏失败: ${e}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleCheckUpdate() {
     setLoading(true);
     setStatus("正在检查更新...");
@@ -116,10 +172,35 @@ function App() {
       const result = await invoke<string>("perform_update", { env: activeEnv });
       setStatus(result);
       await loadAppInfo(activeEnv);
+      // 更新完成后：自动刷新所有 Chrome 标签页，再打开侧边栏（如已配置扩展ID）
+      await postUpdateChromeActions();
     } catch (e) {
       setStatus(`更新失败: ${e}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  /**
+   * 更新完成后的 Chrome 自动化操作：
+   * 1. 刷新所有 Chrome 标签页
+   * 2. 若已配置扩展 ID，自动打开侧边栏
+   */
+  async function postUpdateChromeActions() {
+    try {
+      const refreshResult = await invoke<string>("refresh_chrome_tabs");
+      setStatus((prev) => `${prev}；${refreshResult}`);
+    } catch (e) {
+      // 刷新失败不阻断主流程，仅提示
+      setStatus((prev) => `${prev}；刷新Chrome失败: ${e}`);
+    }
+    if (extensionId) {
+      try {
+        const sidebarResult = await invoke<string>("open_chrome_sidebar", { extensionId });
+        setStatus((prev) => `${prev}；${sidebarResult}`);
+      } catch (e) {
+        setStatus((prev) => `${prev}；打开侧边栏失败: ${e}`);
+      }
     }
   }
 
@@ -193,6 +274,41 @@ function App() {
           <span className="label">下载地址:</span>
           <span className="value path">{appInfo?.download_url || "加载中..."}</span>
         </div>
+
+        {/* Chrome 扩展 ID 行：用于侧边栏 RPA */}
+        <div className="info-row">
+          <span className="label">扩展 ID:</span>
+          {editingExtId ? (
+            <div className="path-edit-group">
+              <input
+                className="path-input"
+                value={extIdInput}
+                onChange={(e) => setExtIdInput(e.target.value)}
+                placeholder="输入32位 Chrome 扩展 ID"
+                maxLength={32}
+                disabled={loading}
+              />
+              <button className="btn-icon btn-confirm" onClick={handleSaveExtId} disabled={loading} title="保存">
+                ✅
+              </button>
+              <button className="btn-icon btn-cancel" onClick={() => setEditingExtId(false)} disabled={loading} title="取消">
+                ❌
+              </button>
+            </div>
+          ) : (
+            <div className="path-display-group">
+              <span className="value path">{extensionId || "未配置"}</span>
+              <button
+                className="btn-edit"
+                onClick={handleEditExtId}
+                disabled={loading}
+                title="配置 Chrome 扩展 ID"
+              >
+                ✏️ 配置
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="actions">
@@ -203,10 +319,18 @@ function App() {
         >
           {loading ? "处理中..." : "🔄 立即检查更新"}
         </button>
+        <button
+          className="btn-sidebar"
+          onClick={handleOpenSidebar}
+          disabled={loading || !extensionId}
+          title={!extensionId ? "请先配置扩展ID" : "打开 aichat 侧边栏"}
+        >
+          🔌 打开 aichat 侧边栏
+        </button>
       </div>
 
       {status && (
-        <div className={`status-msg ${status.includes("失败") ? "error" : status.includes("完成") || status.includes("最新") || status.includes("已保存") ? "success" : "info"}`}>
+        <div className={`status-msg ${status.includes("失败") ? "error" : status.includes("完成") || status.includes("最新") || status.includes("已保存") || status.includes("已打开") ? "success" : "info"}`}>
           {status}
         </div>
       )}

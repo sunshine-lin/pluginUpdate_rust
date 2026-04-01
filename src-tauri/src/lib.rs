@@ -19,11 +19,16 @@ struct CheckResult {
     install_path: String,
 }
 
-/// 自定义路径配置文件结构，区分 online / test 环境
+/// 配置文件结构：记录自定义安装路径（区分 online/test 环境）及 Chrome 扩展 ID
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PathConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     online_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     test_path: Option<String>,
+    /// Chrome 扩展 ID（32位 a-p 小写字母），用于 RPA 打开侧边栏功能
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extension_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -104,6 +109,179 @@ pub fn get_install_path_resolved(env: &str, custom_path: Option<String>) -> Path
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(folder_name)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Chrome 扩展侧边栏 RPA 相关纯函数（可测试）
+// ─────────────────────────────────────────────────────────────────
+
+/// 验证 Chrome 扩展 ID 格式：必须为 32 位 a-p 小写字母
+/// Chrome 使用自定义 base-32：用字母 a-p 代替 0-9a-f
+/// 严格校验可防止命令注入攻击
+pub fn validate_extension_id(id: &str) -> bool {
+    id.len() == 32 && id.chars().all(|c| matches!(c, 'a'..='p'))
+}
+
+/// 从配置文件加载 Chrome 扩展 ID，不存在或格式错误时返回 None
+pub fn load_extension_id_from_file(config_file: &PathBuf) -> Option<String> {
+    let content = fs::read_to_string(config_file).ok()?;
+    let cfg: PathConfig = serde_json::from_str(&content).ok()?;
+    cfg.extension_id
+}
+
+/// 将 Chrome 扩展 ID 写入配置文件（保留其他字段不变）
+/// # Arguments
+/// * `config_file` - 配置文件路径
+/// * `id` - 已通过 validate_extension_id() 校验的扩展 ID
+pub fn save_extension_id_to_file(config_file: &PathBuf, id: &str) -> Result<(), String> {
+    let mut cfg: PathConfig = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        PathConfig::default()
+    };
+    cfg.extension_id = Some(id.to_string());
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let content = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}
+
+/// 构建 macOS AppleScript 脚本：激活 Chrome 并打开扩展侧边栏 URL
+/// 依赖扩展实现 Chrome Side Panel API（Chrome 114+）
+/// NOTE: extension_id 必须经过 validate_extension_id() 校验，否则存在注入风险
+pub fn build_chrome_sidebar_script_macos(extension_id: &str) -> String {
+    format!(
+        "tell application \"Google Chrome\"\nif not running then launch\nactivate\nopen location \"chrome-extension://{}/sidepanel.html\"\nend tell",
+        extension_id
+    )
+}
+
+/// 构建 Windows PowerShell 命令：通过 chrome.exe 打开扩展侧边栏 URL
+/// NOTE: extension_id 必须经过 validate_extension_id() 校验，否则存在注入风险
+pub fn build_chrome_sidebar_command_windows(extension_id: &str) -> String {
+    format!(
+        "Start-Process 'chrome.exe' 'chrome-extension://{}/sidepanel.html'",
+        extension_id
+    )
+}
+
+/// 执行平台相关的 Chrome 侧边栏打开命令（平台分支在编译期决定）
+#[cfg(target_os = "macos")]
+fn run_chrome_sidebar_os(extension_id: &str) -> Result<String, String> {
+    let script = build_chrome_sidebar_script_macos(extension_id);
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("执行AppleScript失败: {}", e))?;
+    if output.status.success() {
+        Ok("已打开 Chrome 扩展侧边栏".to_string())
+    } else {
+        Err(format!(
+            "AppleScript执行失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_chrome_sidebar_os(extension_id: &str) -> Result<String, String> {
+    let cmd = build_chrome_sidebar_command_windows(extension_id);
+    let output = std::process::Command::new("powershell")
+        .args(["-Command", &cmd])
+        .output()
+        .map_err(|e| format!("执行PowerShell失败: {}", e))?;
+    if output.status.success() {
+        Ok("已打开 Chrome 扩展侧边栏".to_string())
+    } else {
+        Err(format!(
+            "PowerShell执行失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_chrome_sidebar_os(_extension_id: &str) -> Result<String, String> {
+    Err("当前平台不支持自动打开 Chrome 扩展侧边栏".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Chrome 标签页刷新相关纯函数（可测试）
+// ─────────────────────────────────────────────────────────────────
+
+/// 构建 macOS AppleScript：刷新所有 Chrome 窗口的所有标签页
+pub fn build_refresh_all_tabs_script_macos() -> String {
+    "tell application \"Google Chrome\"\n\
+     if running then\n\
+       repeat with w in windows\n\
+         repeat with t in tabs of w\n\
+           reload t\n\
+         end repeat\n\
+       end repeat\n\
+     end if\n\
+     end tell"
+        .to_string()
+}
+
+/// 构建 Windows PowerShell 命令：给所有 Chrome 窗口发送 Ctrl+R 刷新快捷键
+pub fn build_refresh_all_tabs_command_windows() -> String {
+    "Add-Type -AssemblyName System.Windows.Forms; \
+     $chrome = Get-Process -Name chrome -ErrorAction SilentlyContinue; \
+     if ($chrome) { \
+       foreach ($w in (New-Object -ComObject Shell.Application).Windows() | \
+         Where-Object { $_.Name -eq 'Google Chrome' }) { \
+         $w.Refresh() \
+       } \
+     }"
+    .to_string()
+}
+
+/// 执行平台相关的 Chrome 标签页刷新命令
+#[cfg(target_os = "macos")]
+fn run_refresh_chrome_tabs_os() -> Result<String, String> {
+    let script = build_refresh_all_tabs_script_macos();
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("执行AppleScript刷新失败: {}", e))?;
+    if output.status.success() {
+        Ok("已刷新所有 Chrome 标签页".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Chrome 未运行时非致命，返回 ok
+        if stderr.contains("is not running") || stderr.is_empty() {
+            Ok("Chrome 未运行，跳过刷新".to_string())
+        } else {
+            Err(format!("AppleScript刷新失败: {}", stderr))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_refresh_chrome_tabs_os() -> Result<String, String> {
+    let cmd = build_refresh_all_tabs_command_windows();
+    let output = std::process::Command::new("powershell")
+        .args(["-Command", &cmd])
+        .output()
+        .map_err(|e| format!("执行PowerShell刷新失败: {}", e))?;
+    if output.status.success() {
+        Ok("已刷新所有 Chrome 标签页".to_string())
+    } else {
+        Err(format!(
+            "PowerShell刷新失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_refresh_chrome_tabs_os() -> Result<String, String> {
+    Err("当前平台不支持自动刷新 Chrome 标签页".to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -203,6 +381,51 @@ fn get_saved_path(env: String) -> Option<String> {
 fn save_custom_path(env: String, path: String) -> Result<(), String> {
     let config_file = get_runtime_config_file();
     save_path_to_config_file(&config_file, &env, &path)
+}
+
+/// 获取已保存的 Chrome 扩展 ID，供前端回显当前配置值
+#[tauri::command]
+fn get_extension_id() -> Option<String> {
+    let config_file = get_runtime_config_file();
+    load_extension_id_from_file(&config_file)
+}
+
+/// 保存 Chrome 扩展 ID 到持久化配置文件，保留安装路径配置不变
+/// # Arguments
+/// * `id` - 32 位 a-p 小写字母的 Chrome 扩展 ID
+#[tauri::command]
+fn save_extension_id(id: String) -> Result<(), String> {
+    if !validate_extension_id(&id) {
+        return Err(format!(
+            "扩展ID格式无效，应为32位 a-p 小写字母，当前值: {}",
+            id
+        ));
+    }
+    let config_file = get_runtime_config_file();
+    save_extension_id_to_file(&config_file, &id)
+}
+
+/// 通过 RPA 打开 Chrome 扩展侧边栏
+/// macOS 使用 osascript + AppleScript，Windows 使用 PowerShell
+/// # Arguments
+/// * `extension_id` - 必须为合法的32位扩展 ID，否则返回错误（防注入）
+#[tauri::command]
+fn open_chrome_sidebar(extension_id: String) -> Result<String, String> {
+    if !validate_extension_id(&extension_id) {
+        return Err(format!(
+            "扩展ID格式无效，应为32位 a-p 小写字母，当前值: {}",
+            extension_id
+        ));
+    }
+    run_chrome_sidebar_os(&extension_id)
+}
+
+/// 刷新所有 Chrome 浏览器标签页
+/// macOS 使用 AppleScript，Windows 使用 PowerShell
+/// Chrome 未运行时不报错，直接返回跳过消息
+#[tauri::command]
+fn refresh_chrome_tabs() -> Result<String, String> {
+    run_refresh_chrome_tabs_os()
 }
 
 /// 检查更新（对比本地与远程版本）
@@ -348,6 +571,10 @@ pub fn run() {
             perform_update,
             get_saved_path,
             save_custom_path,
+            get_extension_id,
+            save_extension_id,
+            open_chrome_sidebar,
+            refresh_chrome_tabs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -491,6 +718,133 @@ mod tests {
             parsed.is_ok(),
             "配置文件不是合法 JSON，会导致下次读取时解析失败: {}",
             content
+        );
+    }
+
+    // 6. Extension ID 格式校验（防注入）
+    #[test]
+    fn test_validate_extension_id_valid() {
+        let valid_id = "abcdefghijklmnopabcdefghijklmnop";
+        assert!(
+            validate_extension_id(valid_id),
+            "合法32位 a-p 扩展ID应通过校验"
+        );
+    }
+
+    #[test]
+    fn test_validate_extension_id_rejects_short() {
+        assert!(
+            !validate_extension_id("abcde"),
+            "短于32位的ID应被拒绝，防止无效配置影响侧边栏功能"
+        );
+    }
+
+    #[test]
+    fn test_validate_extension_id_rejects_injection() {
+        assert!(
+            !validate_extension_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;"),
+            "含分号等特殊字符的ID应被拒绝，防止AppleScript/PowerShell命令注入"
+        );
+        assert!(
+            !validate_extension_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"),
+            "含 z 等非 a-p 字符的ID应被拒绝"
+        );
+    }
+
+    // 7. Extension ID 存读
+    #[test]
+    fn test_save_and_load_extension_id() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        save_extension_id_to_file(&config_file, id).expect("保存扩展ID失败");
+        let loaded = load_extension_id_from_file(&config_file);
+        assert_eq!(
+            loaded,
+            Some(id.to_string()),
+            "扩展ID读取与保存不一致，会导致侧边栏功能无法使用"
+        );
+    }
+
+    #[test]
+    fn test_extension_id_does_not_overwrite_custom_path() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+        save_path_to_config_file(&config_file, "online", "/my/install")
+            .expect("保存路径失败");
+        save_extension_id_to_file(&config_file, "abcdefghijklmnopabcdefghijklmnop")
+            .expect("保存扩展ID失败");
+        let path = load_saved_path_from_file(&config_file, "online");
+        assert_eq!(
+            path,
+            Some("/my/install".to_string()),
+            "保存扩展ID不应覆盖已有安装路径配置，否则会导致更新功能异常"
+        );
+    }
+
+    // 8. Chrome 侧边栏命令构建
+    #[test]
+    fn test_build_macos_script_contains_extension_id() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        let script = build_chrome_sidebar_script_macos(id);
+        assert!(script.contains(id), "macOS AppleScript 应包含扩展ID");
+        assert!(
+            script.contains("sidepanel.html"),
+            "macOS AppleScript 应包含侧边栏页面路径"
+        );
+        assert!(
+            script.contains("Google Chrome"),
+            "macOS AppleScript 应包含 Google Chrome 应用名称"
+        );
+    }
+
+    #[test]
+    fn test_build_windows_command_contains_extension_id() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        let cmd = build_chrome_sidebar_command_windows(id);
+        assert!(cmd.contains(id), "Windows 命令应包含扩展ID");
+        assert!(
+            cmd.contains("sidepanel.html"),
+            "Windows 命令应包含侧边栏页面路径"
+        );
+        assert!(
+            cmd.contains("chrome.exe"),
+            "Windows 命令应包含 chrome.exe"
+        );
+    }
+
+    // 9. Chrome 标签页刷新脚本构建
+    #[test]
+    fn test_build_macos_refresh_script_structure() {
+        let script = build_refresh_all_tabs_script_macos();
+        assert!(
+            script.contains("Google Chrome"),
+            "macOS 刷新脚本应包含 Google Chrome 应用名"
+        );
+        assert!(
+            script.contains("reload t"),
+            "macOS 刷新脚本应包含 reload 命令"
+        );
+        assert!(
+            script.contains("repeat with t in tabs"),
+            "macOS 刷新脚本应遍历所有标签页，否则只会刷新单个标签"
+        );
+        assert!(
+            script.contains("repeat with w in windows"),
+            "macOS 刷新脚本应遍历所有窗口，否则多窗口场景下部分标签不会刷新"
+        );
+    }
+
+    #[test]
+    fn test_build_windows_refresh_command_structure() {
+        let cmd = build_refresh_all_tabs_command_windows();
+        assert!(
+            cmd.contains("chrome"),
+            "Windows 刷新命令应包含 chrome 进程名"
+        );
+        assert!(
+            cmd.contains("Refresh"),
+            "Windows 刷新命令应包含 Refresh 方法调用"
         );
     }
 }
