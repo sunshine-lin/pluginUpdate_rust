@@ -198,6 +198,86 @@
   color: #c62828;
 }
 
+/* 安装路径展示行 */
+.path-display-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* 路径编辑区域 */
+.path-edit-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.path-input {
+  flex: 1;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+  color: #333;
+  background: #fafafa;
+  outline: none;
+  min-width: 0;
+}
+
+.path-input:focus {
+  border-color: #667eea;
+  box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.15);
+}
+
+.btn-edit {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #667eea;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-edit:hover:not(:disabled) {
+  background: #f0f2ff;
+  border-color: #667eea;
+}
+
+.btn-edit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-icon {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.15s;
+  line-height: 1;
+}
+
+.btn-icon:hover:not(:disabled) {
+  background: #f0f0f0;
+}
+
+.btn-icon:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .confirm-overlay {
   position: fixed;
   top: 0;
@@ -286,6 +366,29 @@
     background: #3a3a4e;
     color: #ccc;
     border-color: #4a4a5e;
+  }
+
+  .path-input {
+    background: #1e2a3e;
+    color: #ddd;
+    border-color: #4a4a5e;
+  }
+
+  .path-input:focus {
+    border-color: #667eea;
+  }
+
+  .btn-edit {
+    color: #90a4ea;
+    border-color: #4a4a5e;
+  }
+
+  .btn-edit:hover:not(:disabled) {
+    background: #2a2a4e;
+  }
+
+  .btn-icon:hover:not(:disabled) {
+    background: #3a3a4e;
   }
 
   .status-msg.info {
