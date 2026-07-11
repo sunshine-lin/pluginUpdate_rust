@@ -1,90 +1,174 @@
-# 系统级要求
-规划执行需求开始时，都要使用curl --noproxy "*" 请求地址 https://wiki.cjdropshipping.cn/plugins/viewstorage/viewpagestorage.action?pageId=88507465 查看最新执行要求，规划任务给subagent也需告知subagent需要阅读；
-1、文档需要完整阅读一遍，分析出完整任务后，在当前文档最后阅读位置插入阅读标记“# 26年1月1日 xx:xx:xx(取系统实时日期和时间) ，第x次提交(补充需求时，加上第x次补充)\n👨‍💻**提交人：${git username 运行git命令获取}**\n ## 规划任务: \n### xxxx(任务1)\n### xxxx(任务2)“；
-2、任务完成后在第1条规则插入末尾插入执行结果的时间及状态，例子“## 任务处理结果: \n > ### 📄xxxx(需求编号) 处理结果（使用引用任务信息，生成一个唯一的需求编号，使用 yyMMddHH+序号格式，如果需求与前面的重复则服用最早的需求编号，给出完成内容，如果是排查问题，直接写出排查依据和结果） \n🛑**26年1月1日 xx:xx:xx 第x次提交已完成**”。 
-3、完成每个任务和本文档写入后，使用“ `wc -l`当前文件行号或`tail` 当前文档尾部”的方式检查最新补充，如果存在更新或者补充要求，继续执行第1、2条规则，否则执行下一条规则；
-4、每次重新读取分析当前文档，遵循TDD开发模式及本文档头部相关要求完成任务，检查任务完整性不得跳过；规划最后一个任务必须是使用askQuestions工具要求我补充需求（首选项：阅读 ${当前文档路径} 完成补充任务，如果用户选择此项表示用户在当前文档补充了新需求，需要按照要求重新读取文档内容，如果没有在尾部读取到新内容可能用户未保存，需重新调用askQuestions工具询问）；
-# 任务描述：
-1. 由于虚拟机上只有C盘 需要自定义文件夹路径，同时需要缓存上次的路径，如果没有指定之前设置的路径
-# 26年4月1日 09:38:26 ，第1次提交
-👨‍💻**提交人：shengxia**
-## 规划任务:
-### 添加tauri-plugin-dialog依赖支持原生文件夹选择
-### Rust后端：持久化自定义安装路径（config JSON文件，区分env）
-### Rust后端：新增tauri命令 get_saved_path / save_custom_path / open_folder_dialog
-### 更新get_install_path逻辑：优先使用缓存路径，无则用默认路径
-### 前端UI：安装路径行增加编辑/浏览按钮，支持路径修改与保存
-### 编写TDD测试用例（自定义路径存读、回退默认值）
-### 更新README & 提交Commit
+# aichat 插件更新工具 — 项目架构说明（agents.md）
 
-## 任务处理结果:
-> ### 📄 2604010901-01 自定义安装路径与路径缓存
-> **完成内容：**
-> - `src-tauri/Cargo.toml`：新增 `tauri-plugin-dialog = "2"` 依赖
-> - `src-tauri/src/lib.rs`：新增 `PathConfig` 结构体、`get_config_file_path_with_dir()`、`load_saved_path_from_file()`、`save_path_to_config_file()`、`get_install_path_resolved()` 纯函数；新增 Tauri 命令 `get_saved_path` / `save_custom_path`；`get_install_path()` 优先读取缓存路径，无则回退默认值；注册 `tauri_plugin_dialog` 插件；内联 9 个 TDD 单元测试全部通过
-> - `src-tauri/capabilities/default.json`：新增 `dialog:default` 权限
-> - `src/App.tsx`：路径行新增「✏️ 修改」编辑状态 + 输入框 + 「📁」系统文件夹选择器 + 保存/取消按钮；调用 `save_custom_path` / `get_app_info` 完成持久化
-> - `src/App.css`：新增 `.path-display-group`、`.path-edit-group`、`.path-input`、`.btn-edit`、`.btn-icon` 样式及暗色模式适配
-> - `README.md`：更新功能特点、安装路径说明、使用说明、运行测试章节
+> 生成时间：26年04月02日 11:03:xx | 项目根目录：/Users/sunshine_lin/cj/pluginUpdate_rust
 
-🛑**26年4月1日 10:05:00 第1次提交已完成**
-1. npm run tauri build 解决执行报错 并测试能成功打包
+---
 
-# 26年4月1日 09:59:40 ，第1次补充
-👨‍💻**提交人：shengxia**
-## 规划任务:
-### 执行 npm run tauri build 收集完整报错信息
-### 分析并修复构建报错
-### 验证打包成功
+## 1. 项目定位
 
-## 任务处理结果:
-> ### 📄 2604010901-01 构建修复（复用需求编号）
-> **问题根因：** `src/App.tsx` 文件末尾存在 153 行重复旧代码（`type Env`、`function App`、`export default App` 各出现两次），导致 TypeScript 报 TS2300/TS2393/TS2528 错误，构建失败
-> **修复内容：**
-> - `src/App.tsx`：删除第 236 行以后的全部重复旧代码（包含旧版不含自定义路径功能的 App 组件），文件从 389 行缩减至 236 行
-> - 执行 tsc --noEmit 验证通过
-> - 执行 npm run tauri build 成功，输出 DMG: `src-tauri/target/release/bundle/dmg/aichat Updater_0.1.0_aarch64.dmg`
+桌面端 Tauri v2 应用，用于检测并自动安装 **aichat** Chrome 浏览器插件的更新包。  
+支持线上/测试双环境切换、自定义安装路径持久化、更新后自动刷新 Chrome 标签页及打开插件侧边栏。
 
-🛑**26年4月1日 10:22:00 第1次补充已完成**
+---
 
-# 26年4月1日 10:57:08 ，第2次补充
-👨‍💻**提交人：shengxia**
-## 规划任务:
-### 可行性分析：Tauri 集成 RPA 操控 Chrome 扩展侧边栏
-### Rust 后端：新增 open_chrome_sidebar 命令（macOS AppleScript/Windows PowerShell）
-### 前端 UI：新增「打开 aichat 侧边栏」按钮 + 扩展 ID 输入配置
-### 编写 TDD 测试用例（命令构建逻辑、平台分支）
-### 更新 README & 提交 Commit
-### askQuestions 补充需求
-1. 需要实现以下两个需求：
-  - 点击更新后 需要实现所有谷歌浏览器刷新
-  - 接着 通过RPA的方式 实现点击谷歌浏览器的插件的图标 使得 可以实现自动打开插件侧边栏
-2. 分析下上述需求如何实现，可行性跟方式是什么？
+## 2. 技术栈
 
-## 可行性分析：
-**需求1（刷新所有Chrome标签页）：**
-- macOS：`osascript` AppleScript `tell application "Google Chrome" to reload every tab of every window` ✅ 可行
-- Windows：PowerShell `Shell.Application` + 发送 F5 键至 Chrome 窗口 ✅ 可行
+| 层次 | 技术 |
+|------|------|
+| 前端 UI | React 19 + TypeScript + Vite 7 |
+| 桌面框架 | Tauri v2 |
+| 后端逻辑 | Rust 2021 edition |
+| HTTP 客户端 | reqwest 0.12（async） |
+| 序列化 | serde + serde_json |
+| 文件解压 | zip 2 |
+| 临时目录 | tempfile 3 |
+| 目录解析 | dirs 6 |
+| 对话框插件 | tauri-plugin-dialog 2 |
+| 文件打开 | tauri-plugin-opener 2 |
 
-**需求2（RPA打开侧边栏）：**
-- 直接打开 URL `chrome-extension://<id>/sidepanel.html` 即可触发 Side Panel 展开 ✅ 已实现
-- "点击图标" 方式依赖屏幕坐标不稳定，不推荐
+---
 
-**实现方案：**
-- 新增 Rust 命令 `refresh_chrome_tabs`（macOS AppleScript / Windows PowerShell）
-- `perform_update` 完成后前端自动依次调用：`refresh_chrome_tabs` → `open_chrome_sidebar`（已配置扩展ID时）
+## 3. 目录结构
 
-# 26年4月1日 11:35:54 ，第2次补充（补充需求重新规划）
-👨‍💻**提交人：shengxia**
-## 规划任务:
-### TDD先行：新增 refresh_chrome_tabs 测试用例
-### Rust后端：新增 refresh_chrome_tabs 命令（刷新所有Chrome标签页）
-### 前端：更新完成后自动调用 refresh_chrome_tabs + open_chrome_sidebar
-### 运行全量测试验证
-### 执行 npm run tauri build 验证打包
-### 更新 README & 提交 Commit
-### askQuestions 补充需求
+```
+pluginUpdate_rust/
+├── src/                       # 前端 React 源码
+│   ├── App.tsx                # 主应用组件（所有 UI 逻辑）
+│   ├── App.css                # 组件样式
+│   └── main.tsx               # 前端入口
+├── src-tauri/                 # Rust 后端
+│   ├── src/
+│   │   ├── lib.rs             # 所有 Tauri 命令、纯函数、TDD 测试
+│   │   └── main.rs            # Rust 入口（调用 lib::run()）
+│   ├── Cargo.toml             # Rust 依赖配置
+│   ├── tauri.conf.json        # 线上打包配置
+│   ├── tauri.test.conf.json   # 测试环境打包配置
+│   └── capabilities/
+│       └── default.json       # Tauri 权限（含 dialog:default）
+├── docs/
+│   ├── 需求提示词文档.md        # 主任务文档（阅读标记在此）
+│   └── 需求/                  # 子需求文档（按模块拆分）
+├── agents.md                  # 本文件（项目架构说明）
+├── index.html                 # Tauri 前端入口 HTML
+├── vite.config.ts
+├── tsconfig.json
+└── package.json
+```
 
-# 每次运行的结果插入到本段前面，需求3次补充以后的内容插入到本行前面，以下为每次阅读时候都要确认没有遗忘的规则要求：
-1、每次文档更新需要遵循TDD开发模式及本文档`系统级要求`要求重新规划完成任务；2、规划最后一个任务必须是使用askQuestions工具要求我补充需求（首选项：阅读 ${当前文档路径} 完成补充任务，如果用户选择此项表示用户在当前文档补充了新需求，需要按照要求重新读取文档内容，如果没有在尾部读取到新内容可能用户未保存，需重新调用askQuestions工具询问，检查遗漏未完成的任务使用Multi-select模式列出建议的后续任务），检查任务完整性不得跳过。3、允许直接操作本地的软件和git管理的代码，注意操作远程会有修改、删除数据效果并且不可撤销的操作必须先写入完整的操作方案，然后调用askQuestions工具Multi-select模式询问，确认后按照方案操作。4、当出现纠正的时候需要在修改的每个代码文件、方法前面按照规范写入注意事项注释说明，比如java代码需要遵循java doc注释规范，js代码需要遵循js doc注释规范；阅读代码时需要注意这些注释说明，理解修改的原因和目的；5、及时清理掉无用的文件，无用的日志文件，临时文件保存到tmp目录；6、注意检查保密、密钥等信息不要加入git管理，如果存在提示我需要删除；每次修改需要及时更新README文件；
+---
 
+## 4. 核心业务链路
+
+### 4.1 更新检查与执行
+
+```
+前端 handleCheckUpdate()
+  → invoke("check_update", { env })
+    → Rust: check_update(env)
+      → get_install_path(env)              # 优先缓存路径 > 默认路径
+      → get_local_version(install_path)    # 读取 manifest.json
+      → HTTP GET manifest_url              # 获取远端版本
+      → version_compare(remote, local)     # 比较版本
+  ← CheckResult { has_update, current_version, remote_version, install_path }
+
+如有更新 → 前端显示确认对话框 → handleConfirmUpdate()
+  → invoke("perform_update", { env })
+    → 下载 aichat.zip → 解压到 install_path
+  ← "更新完成！当前版本: x.x.x"
+  → postUpdateChromeActions()
+    → invoke("refresh_chrome_tabs")        # 刷新所有 Chrome 标签页
+    → invoke("open_chrome_sidebar", { extensionId })  # 打开侧边栏（已配置时）
+```
+
+### 4.2 自定义安装路径
+
+```
+前端 handleEditPath() / handleBrowsePath()
+  → 用户输入或系统目录选择对话框（tauri-plugin-dialog）
+  → invoke("save_custom_path", { env, path })
+    → Rust: save_path_to_config_file(config_file, env, path)
+      → 读取已有 config.json（保留另一 env 和 extension_id）
+      → 更新对应 env 路径字段
+      → 写回 config.json
+
+下次加载:
+  → invoke("get_app_info", { env })
+    → Rust: get_install_path(env)
+      → load_saved_path_from_file(config_file, env)
+      → 无则 get_install_path_resolved(env, None) → 默认路径
+```
+
+### 4.3 配置文件结构（~/.config/aichat-updater/config.json）
+
+```json
+{
+  "online_path": "/Users/xxx/aichat",
+  "test_path": "/custom/aichat_test",
+  "extension_id": "abcdefghijklmnopabcdefghijklmnop"
+}
+```
+
+---
+
+## 5. Tauri 命令清单
+
+| 命令 | 入参 | 返回 | 说明 |
+|------|------|------|------|
+| `get_app_info` | `env: String` | `UpdateInfo` | 获取本地版本+路径+下载URL |
+| `check_update` | `env: String` | `Result<CheckResult>` | 对比本地与远端版本 |
+| `perform_update` | `env: String` | `Result<String>` | 下载并解压更新包 |
+| `get_saved_path` | `env: String` | `Option<String>` | 读取缓存路径 |
+| `save_custom_path` | `env, path: String` | `Result<()>` | 持久化自定义路径 |
+| `get_extension_id` | — | `Option<String>` | 读取 Chrome 扩展 ID |
+| `save_extension_id` | `id: String` | `Result<()>` | 持久化扩展 ID（32位a-p） |
+| `open_chrome_sidebar` | `extensionId: String` | `Result<String>` | RPA 打开侧边栏 |
+| `refresh_chrome_tabs` | — | `Result<String>` | 刷新所有 Chrome 标签页 |
+
+---
+
+## 6. TDD 测试覆盖（lib.rs #[cfg(test)]）
+
+共 14 个单元测试，覆盖：
+- 配置文件路径拼接
+- 路径写入/读取/覆盖/多环境隔离
+- 安装路径回退逻辑（自定义 > 默认）
+- 配置 JSON 格式合法性
+- 扩展 ID 格式校验（防注入）
+- 扩展 ID 存读/不覆盖路径
+- Chrome 侧边栏命令构建（macOS/Windows）
+- Chrome 标签页刷新脚本构建（macOS/Windows）
+
+运行命令：
+```bash
+cd src-tauri && cargo test
+```
+
+---
+
+## 7. 构建命令
+
+```bash
+# 线上版本
+npm run tauri build
+# 测试环境版本
+npm run build:test
+# 仅前端编译校验
+npx tsc --noEmit
+```
+
+---
+
+## 8. 环境区分
+
+| 环境 | 下载地址 | 默认安装路径 |
+|------|---------|------------|
+| online | `https://chainai.cjdropshipping.cn/aichat.zip` | `~/aichat` / `D:\aichat` |
+| test | `https://cj-chain-ai.cjdropshipping.offline.pre.cn/aichat.zip` | `~/aichat_test` / `D:\aichat_test` |
+
+---
+
+## 9. 安全说明
+
+- 扩展 ID 严格校验（32位 a-p）防止 AppleScript/PowerShell 命令注入
+- ZIP 解压跳过含 `..` 的路径（防路径穿越攻击）
+- 测试环境禁用 SSL 证书校验 + 绕过系统代理
