@@ -19,7 +19,25 @@ interface CheckResult {
   install_path: string;
 }
 
+interface LogEntry {
+  timestamp: string;
+  level: string;
+  source: string;
+  plugin_name: string;
+  message: string;
+}
+
+interface LogEntriesResult {
+  entries: LogEntry[];
+  plugin_names: string[];
+}
+
+type View = "update" | "logs";
+
+const ALL_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"];
+
 function App() {
+  const [view, setView] = useState<View>("update");
   const [activeEnv, setActiveEnv] = useState<Env>("online");
   const [appInfo, setAppInfo] = useState<UpdateInfo | null>(null);
   const [status, setStatus] = useState<string>("");
@@ -29,10 +47,18 @@ function App() {
   // 路径编辑状态
   const [editingPath, setEditingPath] = useState<boolean>(false);
   const [customPathInput, setCustomPathInput] = useState<string>("");
-  // Chrome 扩展 ID 配置状态
-  const [extensionId, setExtensionId] = useState<string>("");
-  const [editingExtId, setEditingExtId] = useState<boolean>(false);
-  const [extIdInput, setExtIdInput] = useState<string>("");
+  // 日志查看状态
+  const [logDates, setLogDates] = useState<string[]>([]);
+  const [selectedDate, setSelectedDate] = useState<string>("");
+  const [selectedLevels, setSelectedLevels] = useState<Set<string>>(new Set(ALL_LEVELS));
+  const [availablePluginNames, setAvailablePluginNames] = useState<string[]>([]);
+  const [selectedPluginNames, setSelectedPluginNames] = useState<Set<string>>(new Set());
+  const [timeFrom, setTimeFrom] = useState<string>("");
+  const [timeTo, setTimeTo] = useState<string>("");
+  const [keyword, setKeyword] = useState<string>("");
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [logLoading, setLogLoading] = useState<boolean>(false);
+  const [logError, setLogError] = useState<string>("");
 
   useEffect(() => {
     setStatus("");
@@ -43,12 +69,82 @@ function App() {
     loadAppInfo(activeEnv);
   }, [activeEnv]);
 
-  // 加载扩展 ID（只在首次挂载时执行一次）
+  // 切到日志页时加载可选日期列表，默认选最新一天
   useEffect(() => {
-    invoke<string | null>("get_extension_id").then((id) => {
-      if (id) setExtensionId(id);
+    if (view !== "logs") return;
+    invoke<string[]>("list_log_dates").then((dates) => {
+      setLogDates(dates);
+      setSelectedDate((prev) => prev || dates[0] || "");
     });
-  }, []);
+  }, [view]);
+
+  // 日期变化时重新读取当天全量日志；级别/插件名/时间段/关键词都是对这份
+  // 内存数据做组合过滤，不用每次筛选变化都重新调用后端命令
+  useEffect(() => {
+    if (view !== "logs" || !selectedDate) return;
+    setLogLoading(true);
+    setLogError("");
+    invoke<LogEntriesResult>("read_log_entries", { date: selectedDate, errorOnly: false })
+      .then((result) => {
+        setLogEntries(result.entries);
+        setAvailablePluginNames(result.plugin_names);
+        // 默认全选当天出现过的插件名，且旧筛选状态不跨日期保留
+        setSelectedPluginNames(new Set(result.plugin_names));
+      })
+      .catch((e) => setLogError(`读取日志失败: ${e}`))
+      .finally(() => setLogLoading(false));
+  }, [view, selectedDate]);
+
+  function toggleLevel(level: string) {
+    setSelectedLevels((prev) => {
+      const next = new Set(prev);
+      if (next.has(level)) {
+        next.delete(level);
+      } else {
+        next.add(level);
+      }
+      return next;
+    });
+  }
+
+  function togglePluginName(name: string) {
+    setSelectedPluginNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      return next;
+    });
+  }
+
+  const filteredLogEntries = logEntries.filter((e) => {
+    if (!selectedLevels.has(e.level.toUpperCase())) return false;
+    if (!selectedPluginNames.has(e.plugin_name)) return false;
+    if (timeFrom || timeTo) {
+      // timestamp 可能是 "HH:mm:ss.SSS" 或 ISO 格式，取时间部分的 HH:mm 比较
+      const match = e.timestamp.match(/(\d{2}:\d{2})/);
+      const hm = match ? match[1] : "";
+      if (timeFrom && hm < timeFrom) return false;
+      if (timeTo && hm > timeTo) return false;
+    }
+    if (keyword.trim()) {
+      const kw = keyword.trim().toLowerCase();
+      if (!(e.message + e.source + e.level + e.plugin_name).toLowerCase().includes(kw)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  async function handleOpenLogDirFromLogsTab() {
+    try {
+      await invoke<string>("open_log_dir");
+    } catch (e) {
+      setLogError(`打开日志目录失败: ${e}`);
+    }
+  }
 
   async function loadAppInfo(env: Env) {
     try {
@@ -100,51 +196,6 @@ function App() {
     setCustomPathInput("");
   }
 
-  /** 进入扩展 ID 编辑状态 */
-  function handleEditExtId() {
-    setExtIdInput(extensionId);
-    setEditingExtId(true);
-  }
-
-  /** 保存 Chrome 扩展 ID */
-  async function handleSaveExtId() {
-    const trimmed = extIdInput.trim();
-    if (!trimmed) {
-      setStatus("扩展ID不能为空");
-      return;
-    }
-    if (!/^[a-p]{32}$/.test(trimmed)) {
-      setStatus("扩展ID格式无效，应为32位 a-p 小写字母");
-      return;
-    }
-    try {
-      await invoke("save_extension_id", { id: trimmed });
-      setExtensionId(trimmed);
-      setEditingExtId(false);
-      setStatus("扩展 ID 已保存");
-    } catch (e) {
-      setStatus(`保存扩展ID失败: ${e}`);
-    }
-  }
-
-  /** 通过 RPA 打开 Chrome 扩展侧边栏 */
-  async function handleOpenSidebar() {
-    if (!extensionId) {
-      setStatus("请先配置 Chrome 扩展 ID");
-      return;
-    }
-    setLoading(true);
-    setStatus("正在打开 Chrome 扩展侧边栏...");
-    try {
-      const result = await invoke<string>("open_chrome_sidebar", { extensionId });
-      setStatus(result);
-    } catch (e) {
-      setStatus(`打开侧边栏失败: ${e}`);
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function handleCheckUpdate() {
     setLoading(true);
     setStatus("正在检查更新...");
@@ -172,7 +223,7 @@ function App() {
       const result = await invoke<string>("perform_update", { env: activeEnv });
       setStatus(result);
       await loadAppInfo(activeEnv);
-      // 更新完成后：自动刷新所有 Chrome 标签页，再打开侧边栏（如已配置扩展ID）
+      // 更新完成后：自动刷新所有 Chrome 标签页
       await postUpdateChromeActions();
     } catch (e) {
       setStatus(`更新失败: ${e}`);
@@ -181,11 +232,7 @@ function App() {
     }
   }
 
-  /**
-   * 更新完成后的 Chrome 自动化操作：
-   * 1. 刷新所有 Chrome 标签页
-   * 2. 若已配置扩展 ID，自动打开侧边栏
-   */
+  /** 更新完成后自动刷新所有 Chrome 标签页 */
   async function postUpdateChromeActions() {
     try {
       const refreshResult = await invoke<string>("refresh_chrome_tabs");
@@ -194,22 +241,159 @@ function App() {
       // 刷新失败不阻断主流程，仅提示
       setStatus((prev) => `${prev}；刷新Chrome失败: ${e}`);
     }
-    if (extensionId) {
-      try {
-        const sidebarResult = await invoke<string>("open_chrome_sidebar", { extensionId });
-        setStatus((prev) => `${prev}；${sidebarResult}`);
-      } catch (e) {
-        setStatus((prev) => `${prev}；打开侧边栏失败: ${e}`);
-      }
-    }
   }
 
   return (
-    <main className="container">
-      <div className="header">
-        <h1>aichat 插件更新工具</h1>
+    <main className={view === "logs" ? "container container-wide" : "container"}>
+      <div className="view-tabs">
+        <button
+          className={`view-tab-btn ${view === "update" ? "view-tab-active" : ""}`}
+          onClick={() => setView("update")}
+        >
+          更新管理
+        </button>
+        <button
+          className={`view-tab-btn ${view === "logs" ? "view-tab-active" : ""}`}
+          onClick={() => setView("logs")}
+        >
+          日志查看
+        </button>
       </div>
 
+      {view === "logs" ? (
+        <div className="log-view">
+          <div className="log-toolbar">
+            <select
+              className="log-date-select"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              disabled={logDates.length === 0}
+            >
+              {logDates.length === 0 ? (
+                <option value="">暂无日志</option>
+              ) : (
+                logDates.map((d) => (
+                  <option key={d} value={d}>
+                    {d}
+                  </option>
+                ))
+              )}
+            </select>
+
+            <div className="log-time-range">
+              <input
+                type="time"
+                className="log-time-input"
+                value={timeFrom}
+                onChange={(e) => setTimeFrom(e.target.value)}
+                title="开始时间"
+              />
+              <span className="log-time-sep">~</span>
+              <input
+                type="time"
+                className="log-time-input"
+                value={timeTo}
+                onChange={(e) => setTimeTo(e.target.value)}
+                title="结束时间"
+              />
+            </div>
+
+            <input
+              className="log-search-input"
+              type="text"
+              placeholder="搜索关键词..."
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+            />
+
+            <button className="btn-secondary" onClick={handleOpenLogDirFromLogsTab}>
+              📁 打开日志目录
+            </button>
+          </div>
+
+          <div className="log-toolbar log-toolbar-filters">
+            <div className="log-filter-group">
+              <span className="log-filter-label">级别:</span>
+              {ALL_LEVELS.map((level) => (
+                <label
+                  key={level}
+                  className={`log-filter-chip log-level-${level.toLowerCase()} ${
+                    selectedLevels.has(level) ? "log-filter-chip-active" : ""
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedLevels.has(level)}
+                    onChange={() => toggleLevel(level)}
+                  />
+                  {level}
+                </label>
+              ))}
+            </div>
+
+            {availablePluginNames.length > 0 && (
+              <div className="log-filter-group">
+                <span className="log-filter-label">插件名:</span>
+                {availablePluginNames.map((name) => (
+                  <label
+                    key={name}
+                    className={`log-filter-chip ${
+                      selectedPluginNames.has(name) ? "log-filter-chip-active" : ""
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedPluginNames.has(name)}
+                      onChange={() => togglePluginName(name)}
+                    />
+                    {name}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {logError && <div className="status-msg error">{logError}</div>}
+
+          <div className="log-table-wrap">
+            {logLoading ? (
+              <div className="log-empty">加载中...</div>
+            ) : filteredLogEntries.length === 0 ? (
+              <div className="log-empty">
+                {logDates.length === 0 ? "暂无日志文件" : "没有符合条件的日志"}
+              </div>
+            ) : (
+              <table className="log-table">
+                <thead>
+                  <tr>
+                    <th className="col-ts">时间</th>
+                    <th className="col-level">级别</th>
+                    <th className="col-source">来源</th>
+                    <th className="col-plugin">插件名</th>
+                    <th className="col-message">消息</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredLogEntries.map((entry, idx) => (
+                    <tr key={idx}>
+                      <td className="col-ts">{entry.timestamp}</td>
+                      <td className="col-level">
+                        <span className={`log-level-badge log-level-${entry.level.toLowerCase()}`}>
+                          {entry.level}
+                        </span>
+                      </td>
+                      <td className="col-source">{entry.source}</td>
+                      <td className="col-plugin">{entry.plugin_name}</td>
+                      <td className="col-message">{entry.message}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      ) : (
+        <>
       <div className="env-tabs">
         <button
           className={`tab-btn ${activeEnv === "online" ? "tab-active tab-online" : ""}`}
@@ -274,41 +458,6 @@ function App() {
           <span className="label">下载地址:</span>
           <span className="value path">{appInfo?.download_url || "加载中..."}</span>
         </div>
-
-        {/* Chrome 扩展 ID 行：用于侧边栏 RPA */}
-        <div className="info-row">
-          <span className="label">扩展 ID:</span>
-          {editingExtId ? (
-            <div className="path-edit-group">
-              <input
-                className="path-input"
-                value={extIdInput}
-                onChange={(e) => setExtIdInput(e.target.value)}
-                placeholder="输入32位 Chrome 扩展 ID"
-                maxLength={32}
-                disabled={loading}
-              />
-              <button className="btn-icon btn-confirm" onClick={handleSaveExtId} disabled={loading} title="保存">
-                ✅
-              </button>
-              <button className="btn-icon btn-cancel" onClick={() => setEditingExtId(false)} disabled={loading} title="取消">
-                ❌
-              </button>
-            </div>
-          ) : (
-            <div className="path-display-group">
-              <span className="value path">{extensionId || "未配置"}</span>
-              <button
-                className="btn-edit"
-                onClick={handleEditExtId}
-                disabled={loading}
-                title="配置 Chrome 扩展 ID"
-              >
-                ✏️ 配置
-              </button>
-            </div>
-          )}
-        </div>
       </div>
 
       <div className="actions">
@@ -318,14 +467,6 @@ function App() {
           disabled={loading}
         >
           {loading ? "处理中..." : "🔄 立即检查更新"}
-        </button>
-        <button
-          className="btn-sidebar"
-          onClick={handleOpenSidebar}
-          disabled={loading || !extensionId}
-          title={!extensionId ? "请先配置扩展ID" : "打开 aichat 侧边栏"}
-        >
-          🔌 打开 aichat 侧边栏
         </button>
       </div>
 
@@ -352,6 +493,8 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
     </main>
   );

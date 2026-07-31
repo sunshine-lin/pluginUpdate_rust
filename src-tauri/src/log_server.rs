@@ -1,0 +1,305 @@
+//! 本地日志接收服务（Task 1.2）
+//!
+//! 插件运行在浏览器沙箱内无法写文件，故由本服务接收其日志并转交落盘。
+//!
+//! # 安全边界
+//! **仅绑定 127.0.0.1**，不监听 0.0.0.0 —— AIChat 日志可能包含登录 token、
+//! 供应商聊天内容与采购报价，暴露到局域网的风险高于插件本身崩溃。
+//! 如需跨机器取日志（规划 Phase 3），必须同时补齐鉴权、脱敏与网段白名单。
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// 起始端口。插件侧需与此一致；被占用时向后递增探测
+pub const DEFAULT_PORT: u16 = 17653;
+/// 端口探测的最大尝试次数
+const MAX_PORT_PROBE: u16 = 10;
+
+/// 单条日志条目（插件 POST /log 的数组元素）。
+/// 插件侧（TypeScript）用驼峰命名字段，rename_all 使 serde 按驼峰匹配 JSON，
+/// Rust 代码内仍用蛇形字段名——否则如 pluginName 这类复合词字段会静默解析失败。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// 插件侧时间戳；缺失时由服务端补当前时间
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub level: Option<String>,
+    /// 日志来源，如 background / sidepanel / content
+    #[serde(default)]
+    pub source: Option<String>,
+    /// 插件名，标识具体是哪台机器/哪个采购账号；缺失时回落 unknown
+    #[serde(default)]
+    pub plugin_name: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
+    /// 客户端版本，供插件判断兼容性
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LogAck {
+    received: usize,
+}
+
+/// 日志写入接口。Task 1.3 将以文件轮转实现替换当前的标准输出实现，
+/// 抽象为 trait 以便 1.2 阶段即可独立联调、且写入策略可单测
+pub trait LogSink: Send + Sync {
+    fn write_line(&self, line: &str, is_error: bool);
+}
+
+/// 1.2 阶段的临时实现：仅打到标准输出，验证链路连通性
+pub struct StdoutSink;
+
+impl LogSink for StdoutSink {
+    fn write_line(&self, line: &str, _is_error: bool) {
+        println!("{}", line);
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    sink: Arc<dyn LogSink>,
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+/// 接收批量日志。约定返回 200 + 已接收条数；
+/// 即使部分条目异常也不返回错误码 —— 插件侧不应因日志失败而干扰主业务
+async fn ingest_log(
+    State(state): State<AppState>,
+    Json(entries): Json<Vec<LogEntry>>,
+) -> (StatusCode, Json<LogAck>) {
+    let count = entries.len();
+    for e in entries {
+        let ts = e
+            .timestamp
+            .unwrap_or_else(|| crate::current_timestamp());
+        let level = e.level.unwrap_or_else(|| "info".to_string());
+        let source = e.source.unwrap_or_else(|| "unknown".to_string());
+        let plugin_name = e.plugin_name.unwrap_or_else(|| "unknown".to_string());
+        let line = crate::format_log_line(&ts, &level, &source, &plugin_name, &e.message);
+        state.sink.write_line(&line, crate::is_error_level(&level));
+    }
+    (StatusCode::OK, Json(LogAck { received: count }))
+}
+
+fn build_router(sink: Arc<dyn LogSink>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/log", post(ingest_log))
+        .with_state(AppState { sink })
+}
+
+/// 在后台线程启动日志服务，返回实际绑定的端口。
+/// 绑定失败（端口全被占用）时返回 Err，调用方应降级为「不收集日志」而非阻断启动
+pub fn spawn(sink: Arc<dyn LogSink>) -> Result<u16, String> {
+    let listener = bind_loopback()?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("读取监听地址失败: {}", e))?
+        .port();
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("日志服务运行时创建失败: {}", e);
+                return;
+            }
+        };
+        rt.block_on(async move {
+            listener
+                .set_nonblocking(true)
+                .expect("设置非阻塞失败，日志服务无法启动");
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("日志服务监听转换失败: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = axum::serve(listener, build_router(sink)).await {
+                eprintln!("日志服务异常退出: {}", e);
+            }
+        });
+    });
+
+    Ok(port)
+}
+
+/// 从 DEFAULT_PORT 起探测可用端口，仅绑定回环地址
+fn bind_loopback() -> Result<std::net::TcpListener, String> {
+    for offset in 0..MAX_PORT_PROBE {
+        let port = DEFAULT_PORT + offset;
+        // 显式使用 127.0.0.1 而非 0.0.0.0：见模块头部安全说明
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return Ok(l);
+        }
+    }
+    Err(format!(
+        "端口 {}~{} 均被占用，日志服务无法启动",
+        DEFAULT_PORT,
+        DEFAULT_PORT + MAX_PORT_PROBE - 1
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 收集写入内容的测试替身
+    struct MemSink {
+        lines: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl LogSink for MemSink {
+        fn write_line(&self, line: &str, is_error: bool) {
+            self.lines
+                .lock()
+                .expect("测试 sink 锁获取失败")
+                .push((line.to_string(), is_error));
+        }
+    }
+
+    #[test]
+    fn test_bind_loopback_returns_listener_on_local_address() {
+        let listener = bind_loopback().expect("绑定回环地址失败，日志服务无法启动");
+        let addr = listener.local_addr().expect("读取地址失败");
+        assert!(
+            addr.ip().is_loopback(),
+            "日志服务必须绑定回环地址；绑定 0.0.0.0 会将含 token 的日志暴露到局域网"
+        );
+        assert!(
+            addr.port() >= DEFAULT_PORT && addr.port() < DEFAULT_PORT + MAX_PORT_PROBE,
+            "端口应落在约定探测区间内，否则插件侧无法发现服务"
+        );
+    }
+
+    #[test]
+    fn test_bind_loopback_probes_next_port_when_occupied() {
+        let first = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT));
+        // 若首端口本就被外部占用则跳过，避免误报
+        if first.is_err() {
+            return;
+        }
+        let second = bind_loopback().expect("首端口被占用时应探测到下一个可用端口");
+        assert_ne!(
+            second.local_addr().expect("读取地址失败").port(),
+            DEFAULT_PORT,
+            "首端口已被占用，应返回不同端口，否则多实例场景下日志服务启动失败"
+        );
+    }
+
+    #[test]
+    fn test_log_entry_deserializes_from_camel_case_json() {
+        // 插件侧（TypeScript）用驼峰命名 pluginName，若结构体不做 rename_all，
+        // serde 精确匹配字段名会导致解析不到、静默回落 None——这是真实踩过的坑
+        let json = r#"{"level":"error","source":"background","pluginName":"robot-01","message":"崩溃"}"#;
+        let entry: LogEntry = serde_json::from_str(json).expect("应能解析插件侧实际发送的驼峰命名 JSON");
+        assert_eq!(
+            entry.plugin_name,
+            Some("robot-01".to_string()),
+            "pluginName（驼峰）应正确映射到 plugin_name 字段，否则日志里插件名永远是 unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_log_writes_each_entry_to_sink() {
+        let sink = Arc::new(MemSink {
+            lines: Mutex::new(Vec::new()),
+        });
+        let entries = vec![
+            LogEntry {
+                timestamp: Some("2026-07-29 10:00:00.000".into()),
+                level: Some("error".into()),
+                source: Some("background".into()),
+                plugin_name: Some("robot-01".into()),
+                message: "崩溃了".into(),
+            },
+            LogEntry {
+                timestamp: Some("2026-07-29 10:00:01.000".into()),
+                level: Some("info".into()),
+                source: Some("sidepanel".into()),
+                plugin_name: Some("robot-01".into()),
+                message: "正常".into(),
+            },
+        ];
+        let (status, ack) = ingest_log(
+            State(AppState {
+                sink: sink.clone() as Arc<dyn LogSink>,
+            }),
+            Json(entries),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "日志接收应返回 200");
+        assert_eq!(ack.received, 2, "应回报实际接收条数，供插件侧确认送达");
+
+        let lines = sink.lines.lock().expect("锁获取失败");
+        assert_eq!(lines.len(), 2, "两条日志都应写入 sink，漏写会导致排查时缺失线索");
+        assert!(lines[0].1, "error 级别应标记为异常，供异常日志单独归集");
+        assert!(!lines[1].1, "info 级别不应标记为异常");
+        assert!(
+            lines[0].0.contains("ERROR") && lines[0].0.contains("background"),
+            "写入内容应为格式化后的完整日志行"
+        );
+        assert!(
+            lines[0].0.contains("robot-01"),
+            "写入内容应含插件名，否则多台机器日志混在一起无法区分来源"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_log_fills_defaults_for_missing_fields() {
+        let sink = Arc::new(MemSink {
+            lines: Mutex::new(Vec::new()),
+        });
+        let entries = vec![LogEntry {
+            timestamp: None,
+            level: None,
+            source: None,
+            plugin_name: None,
+            message: "字段缺失".into(),
+        }];
+        let (status, _) = ingest_log(
+            State(AppState {
+                sink: sink.clone() as Arc<dyn LogSink>,
+            }),
+            Json(entries),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "字段缺失不应导致失败，否则插件侧一处遗漏就会丢掉整批日志"
+        );
+        let lines = sink.lines.lock().expect("锁获取失败");
+        assert_eq!(lines.len(), 1, "缺字段的日志仍应落地");
+        assert!(
+            lines[0].0.contains("INFO") && lines[0].0.contains("unknown"),
+            "缺失的级别/来源应回落为 INFO/unknown 而非丢弃该条"
+        );
+    }
+}

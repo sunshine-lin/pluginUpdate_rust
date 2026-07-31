@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -23,4 +23,8 @@ tokio = { version = "1", features = ["full"] }
 zip = "2"
 tempfile = "3"
 dirs = "6"
+tauri-plugin-single-instance = "2.4.3"
+tauri-plugin-autostart = "2.5.1"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 

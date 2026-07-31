@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use tauri::Manager;
+
+pub mod log_file;
+pub mod log_server;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateInfo {
@@ -19,16 +23,20 @@ struct CheckResult {
     install_path: String,
 }
 
-/// 配置文件结构：记录自定义安装路径（区分 online/test 环境）及 Chrome 扩展 ID
+/// 配置文件结构：记录自定义安装路径（区分 online/test 环境）
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PathConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     online_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_path: Option<String>,
-    /// Chrome 扩展 ID（32位 a-p 小写字母），用于 RPA 打开侧边栏功能
+    /// 开机自启偏好。默认关闭：装上不改变用户开机行为，由用户在托盘菜单主动开启
     #[serde(skip_serializing_if = "Option::is_none")]
-    extension_id: Option<String>,
+    autostart: Option<bool>,
+    /// 透传本结构未声明的字段。serde 默认丢弃未知字段，
+    /// 若不保留会在写入任一配置项时静默抹掉其它程序写入的数据
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -111,29 +119,21 @@ pub fn get_install_path_resolved(env: &str, custom_path: Option<String>) -> Path
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Chrome 扩展侧边栏 RPA 相关纯函数（可测试）
-// ─────────────────────────────────────────────────────────────────
-
-/// 验证 Chrome 扩展 ID 格式：必须为 32 位 a-p 小写字母
-/// Chrome 使用自定义 base-32：用字母 a-p 代替 0-9a-f
-/// 严格校验可防止命令注入攻击
-pub fn validate_extension_id(id: &str) -> bool {
-    id.len() == 32 && id.chars().all(|c| matches!(c, 'a'..='p'))
+/// 从配置文件加载开机自启偏好。
+/// 配置缺失/解析失败时返回 false —— 默认不自启，避免未经用户同意修改开机项
+pub fn load_autostart_from_file(config_file: &PathBuf) -> bool {
+    fs::read_to_string(config_file)
+        .ok()
+        .and_then(|c| serde_json::from_str::<PathConfig>(&c).ok())
+        .and_then(|cfg| cfg.autostart)
+        .unwrap_or(false)
 }
 
-/// 从配置文件加载 Chrome 扩展 ID，不存在或格式错误时返回 None
-pub fn load_extension_id_from_file(config_file: &PathBuf) -> Option<String> {
-    let content = fs::read_to_string(config_file).ok()?;
-    let cfg: PathConfig = serde_json::from_str(&content).ok()?;
-    cfg.extension_id
-}
-
-/// 将 Chrome 扩展 ID 写入配置文件（保留其他字段不变）
+/// 将开机自启偏好写入配置文件（保留其他字段不变）
 /// # Arguments
 /// * `config_file` - 配置文件路径
-/// * `id` - 已通过 validate_extension_id() 校验的扩展 ID
-pub fn save_extension_id_to_file(config_file: &PathBuf, id: &str) -> Result<(), String> {
+/// * `enabled` - 是否开机自启
+pub fn save_autostart_to_file(config_file: &PathBuf, enabled: bool) -> Result<(), String> {
     let mut cfg: PathConfig = if config_file.exists() {
         fs::read_to_string(config_file)
             .ok()
@@ -142,7 +142,7 @@ pub fn save_extension_id_to_file(config_file: &PathBuf, id: &str) -> Result<(), 
     } else {
         PathConfig::default()
     };
-    cfg.extension_id = Some(id.to_string());
+    cfg.autostart = Some(enabled);
     if let Some(parent) = config_file.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
     }
@@ -151,63 +151,54 @@ pub fn save_extension_id_to_file(config_file: &PathBuf, id: &str) -> Result<(), 
     fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
 }
 
-/// 构建 macOS AppleScript 脚本：激活 Chrome 并打开扩展侧边栏 URL
-/// 依赖扩展实现 Chrome Side Panel API（Chrome 114+）
-/// NOTE: extension_id 必须经过 validate_extension_id() 校验，否则存在注入风险
-pub fn build_chrome_sidebar_script_macos(extension_id: &str) -> String {
-    format!(
-        "tell application \"Google Chrome\"\nif not running then launch\nactivate\nopen location \"chrome-extension://{}/sidepanel.html\"\nend tell",
-        extension_id
-    )
-}
+// ─────────────────────────────────────────────────────────────────
+// 日志格式化纯函数（Task 1.2/1.3，可测试）
+// ─────────────────────────────────────────────────────────────────
 
-/// 构建 Windows PowerShell 命令：通过 chrome.exe 打开扩展侧边栏 URL
-/// NOTE: extension_id 必须经过 validate_extension_id() 校验，否则存在注入风险
-pub fn build_chrome_sidebar_command_windows(extension_id: &str) -> String {
-    format!(
-        "Start-Process 'chrome.exe' 'chrome-extension://{}/sidepanel.html'",
-        extension_id
-    )
-}
-
-/// 执行平台相关的 Chrome 侧边栏打开命令（平台分支在编译期决定）
-#[cfg(target_os = "macos")]
-fn run_chrome_sidebar_os(extension_id: &str) -> Result<String, String> {
-    let script = build_chrome_sidebar_script_macos(extension_id);
-    let output = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map_err(|e| format!("执行AppleScript失败: {}", e))?;
-    if output.status.success() {
-        Ok("已打开 Chrome 扩展侧边栏".to_string())
-    } else {
-        Err(format!(
-            "AppleScript执行失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+/// 将插件传入的日志级别归一为固定大写形式。
+/// 未知级别回落 INFO 而非丢弃，避免插件传入非约定值时日志静默消失
+pub fn normalize_log_level(level: &str) -> &'static str {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "error" | "err" => "ERROR",
+        "warn" | "warning" => "WARN",
+        "debug" => "DEBUG",
+        _ => "INFO",
     }
 }
 
-#[cfg(target_os = "windows")]
-fn run_chrome_sidebar_os(extension_id: &str) -> Result<String, String> {
-    let cmd = build_chrome_sidebar_command_windows(extension_id);
-    let output = std::process::Command::new("powershell")
-        .args(["-Command", &cmd])
-        .output()
-        .map_err(|e| format!("执行PowerShell失败: {}", e))?;
-    if output.status.success() {
-        Ok("已打开 Chrome 扩展侧边栏".to_string())
-    } else {
-        Err(format!(
-            "PowerShell执行失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+/// 判断该级别是否应额外写入异常日志文件（供 AI 分析用，Task 2.3）
+pub fn is_error_level(level: &str) -> bool {
+    matches!(normalize_log_level(level), "ERROR" | "WARN")
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn run_chrome_sidebar_os(_extension_id: &str) -> Result<String, String> {
-    Err("当前平台不支持自动打开 Chrome 扩展侧边栏".to_string())
+/// 格式化单条日志为一行文本：`[时间] [级别] [来源] [插件名] 消息`
+/// 插件名标识具体是哪台机器/哪个采购账号（见插件侧 PLUGIN_NAME），
+/// 多台机器的日志汇总后靠这个字段区分来源。消息内的换行/回车会被转义，
+/// 保证「一行一条」，否则 grep 与 AI 解析会错乱
+pub fn format_log_line(
+    timestamp: &str,
+    level: &str,
+    source: &str,
+    plugin_name: &str,
+    message: &str,
+) -> String {
+    let flat = message.replace('\r', "").replace('\n', "\\n");
+    format!(
+        "[{}] [{}] [{}] [{}] {}",
+        timestamp,
+        normalize_log_level(level),
+        source,
+        plugin_name,
+        flat
+    )
+}
+
+/// 当前本地时间戳，格式 `YYYY-MM-DD HH:MM:SS.mmm`。
+/// 插件未提供 timestamp 时由服务端补齐
+pub fn current_timestamp() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -302,6 +293,28 @@ fn get_runtime_config_file() -> PathBuf {
     get_config_file_path_with_dir(&get_app_config_dir())
 }
 
+/// 获取日志目录（Task 1.3 落盘位置，Task 1.1 托盘菜单先用于打开目录）
+/// macOS 遵循 ~/Library/Logs 约定，Windows 用 LOCALAPPDATA，其他平台回落配置目录
+#[cfg(target_os = "macos")]
+fn get_log_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/Logs/aichat-updater")
+}
+
+#[cfg(target_os = "windows")]
+fn get_log_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| get_app_config_dir())
+        .join("aichat-updater")
+        .join("logs")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_log_dir() -> PathBuf {
+    get_app_config_dir().join("logs")
+}
+
 /// 根据运行时环境获取下载 URL
 fn get_download_url(env: &str) -> String {
     if env == "test" {
@@ -383,41 +396,105 @@ fn save_custom_path(env: String, path: String) -> Result<(), String> {
     save_path_to_config_file(&config_file, &env, &path)
 }
 
-/// 获取已保存的 Chrome 扩展 ID，供前端回显当前配置值
-#[tauri::command]
-fn get_extension_id() -> Option<String> {
-    let config_file = get_runtime_config_file();
-    load_extension_id_from_file(&config_file)
+/// 日志服务实际绑定的端口。0 表示未启动成功
+static LOG_SERVER_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// 全局日志写入器：客户端自身的错误（如托盘操作失败）与插件转发日志
+/// 共用同一套落盘文件，而非仅打到 stdout/stderr——打包后 stderr 无人接收，
+/// 之前的 eprintln! 在生产环境等于没记录
+static LOG_SINK: std::sync::OnceLock<std::sync::Arc<dyn log_server::LogSink>> =
+    std::sync::OnceLock::new();
+
+/// 构建客户端自身错误的日志行（可测试的纯函数部分）
+pub fn build_client_error_line(message: &str) -> String {
+    format_log_line(&current_timestamp(), "error", "client", "client", message)
 }
 
-/// 保存 Chrome 扩展 ID 到持久化配置文件，保留安装路径配置不变
-/// # Arguments
-/// * `id` - 32 位 a-p 小写字母的 Chrome 扩展 ID
-#[tauri::command]
-fn save_extension_id(id: String) -> Result<(), String> {
-    if !validate_extension_id(&id) {
-        return Err(format!(
-            "扩展ID格式无效，应为32位 a-p 小写字母，当前值: {}",
-            id
-        ));
+/// 记录客户端自身产生的错误。日志服务未就绪时回落到 eprintln!，
+/// 保证初始化早期阶段的报错不会被静默丢弃
+pub fn log_client_error(message: &str) {
+    let line = build_client_error_line(message);
+    match LOG_SINK.get() {
+        Some(sink) => sink.write_line(&line, true),
+        None => eprintln!("{}", line),
     }
-    let config_file = get_runtime_config_file();
-    save_extension_id_to_file(&config_file, &id)
 }
 
-/// 通过 RPA 打开 Chrome 扩展侧边栏
-/// macOS 使用 osascript + AppleScript，Windows 使用 PowerShell
-/// # Arguments
-/// * `extension_id` - 必须为合法的32位扩展 ID，否则返回错误（防注入）
+/// 获取日志服务端口，供前端展示与插件侧发现（0 表示服务未启动）
 #[tauri::command]
-fn open_chrome_sidebar(extension_id: String) -> Result<String, String> {
-    if !validate_extension_id(&extension_id) {
-        return Err(format!(
-            "扩展ID格式无效，应为32位 a-p 小写字母，当前值: {}",
-            extension_id
-        ));
+fn get_log_server_port() -> u16 {
+    LOG_SERVER_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 获取开机自启偏好，供前端/托盘菜单回显开关状态
+#[tauri::command]
+fn get_autostart() -> bool {
+    load_autostart_from_file(&get_runtime_config_file())
+}
+
+/// 设置开机自启：同时写入配置并调用系统级注册（注册表 / LaunchAgent）
+/// 配置与系统状态需保持一致，任一失败都返回 Err 以避免开关状态与实际行为不符
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager
+            .enable()
+            .map_err(|e| format!("开启开机自启失败: {}", e))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|e| format!("关闭开机自启失败: {}", e))?;
     }
-    run_chrome_sidebar_os(&extension_id)
+    save_autostart_to_file(&get_runtime_config_file(), enabled)
+}
+
+/// 打开日志目录（供托盘菜单与前端调用，Task 1.3 落盘后即有内容）
+#[tauri::command]
+fn open_log_dir() -> Result<String, String> {
+    let dir = get_log_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let program = "xdg-open";
+
+    std::process::Command::new(program)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开日志目录失败: {}", e))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 列出当前有日志的日期（去重、按最新优先排序），供前端日志查看页日期下拉框使用
+#[tauri::command]
+fn list_log_dates() -> Vec<String> {
+    log_file::list_log_dates_in_dir(&get_log_dir())
+}
+
+/// read_log_entries 的返回结构：日志条目 + 当天出现过的插件名去重列表，
+/// 供前端筛选下拉框展示可选项，避免为此再单独调用一次命令
+#[derive(Debug, Serialize)]
+struct LogEntriesResult {
+    entries: Vec<log_file::LogEntry>,
+    plugin_names: Vec<String>,
+}
+
+/// 读取指定日期的日志条目
+/// # Arguments
+/// * `date` - 格式 YYYY-MM-DD
+/// * `error_only` - true 时只读异常（ERROR/WARN）日志文件
+#[tauri::command]
+fn read_log_entries(date: String, error_only: bool) -> Result<LogEntriesResult, String> {
+    let entries = log_file::read_log_entries_from_dir(&get_log_dir(), &date, error_only)?;
+    let plugin_names = log_file::collect_plugin_names(&entries);
+    Ok(LogEntriesResult {
+        entries,
+        plugin_names,
+    })
 }
 
 /// 刷新所有 Chrome 浏览器标签页
@@ -563,21 +640,141 @@ async fn perform_update(env: String) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例锁：常驻后重复启动只唤回已有窗口，避免多进程抢占日志端口（Task 1.2）
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
+        // 开机自启：默认不注册，由用户在托盘菜单主动开启
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            build_tray(app.handle())?;
+            // 日志服务启动失败不阻断应用：更新功能仍应可用，仅退化为不收集日志
+            let sink: std::sync::Arc<dyn log_server::LogSink> =
+                std::sync::Arc::new(log_file::FileSink::new(get_log_dir()));
+            let _ = LOG_SINK.set(sink.clone());
+            match log_server::spawn(sink) {
+                Ok(port) => {
+                    LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+                    println!(
+                        "日志服务已启动: http://127.0.0.1:{}，日志目录: {:?}",
+                        port,
+                        get_log_dir()
+                    );
+                }
+                Err(e) => log_client_error(&format!("日志服务启动失败（不影响更新功能）: {}", e)),
+            }
+            Ok(())
+        })
+        // 关窗口不退进程：常驻看护的前提，改为隐藏到托盘
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             check_update,
             perform_update,
             get_saved_path,
             save_custom_path,
-            get_extension_id,
-            save_extension_id,
-            open_chrome_sidebar,
             refresh_chrome_tabs,
+            get_autostart,
+            set_autostart,
+            open_log_dir,
+            get_log_server_port,
+            list_log_dates,
+            read_log_entries,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// 显示并聚焦主窗口（托盘点击、单实例唤回共用）
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// 构建系统托盘：图标常驻 + 菜单（显示窗口 / 打开日志目录 / 开机自启 / 退出）
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let log_item = MenuItem::with_id(app, "open_log", "打开日志目录", true, None::<&str>)?;
+    let autostart_item = CheckMenuItem::with_id(
+        app,
+        "toggle_autostart",
+        "开机自启",
+        true,
+        load_autostart_from_file(&get_runtime_config_file()),
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &log_item,
+            &PredefinedMenuItem::separator(app)?,
+            &autostart_item,
+            &PredefinedMenuItem::separator(app)?,
+            &quit_item,
+        ],
+    )?;
+
+    TrayIconBuilder::with_id("main-tray")
+        .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("aichat 插件更新工具")
+        .menu(&menu)
+        // 左键单击托盘图标唤回窗口（Windows 习惯用法；macOS 由菜单承担）
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "open_log" => {
+                if let Err(e) = open_log_dir() {
+                    log_client_error(&format!("打开日志目录失败: {}", e));
+                }
+            }
+            "toggle_autostart" => {
+                let config_file = get_runtime_config_file();
+                let next = !load_autostart_from_file(&config_file);
+                match set_autostart(app.clone(), next) {
+                    // 系统注册成功后才同步勾选态，失败则保持原状避免显示与实际不符
+                    Ok(()) => {
+                        if let Some(item) = app.menu().and_then(|m| m.get("toggle_autostart")) {
+                            if let Some(check) = item.as_check_menuitem() {
+                                let _ = check.set_checked(next);
+                            }
+                        }
+                    }
+                    Err(e) => log_client_error(&format!("切换开机自启失败: {}", e)),
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -721,99 +918,7 @@ mod tests {
         );
     }
 
-    // 6. Extension ID 格式校验（防注入）
-    #[test]
-    fn test_validate_extension_id_valid() {
-        let valid_id = "abcdefghijklmnopabcdefghijklmnop";
-        assert!(
-            validate_extension_id(valid_id),
-            "合法32位 a-p 扩展ID应通过校验"
-        );
-    }
-
-    #[test]
-    fn test_validate_extension_id_rejects_short() {
-        assert!(
-            !validate_extension_id("abcde"),
-            "短于32位的ID应被拒绝，防止无效配置影响侧边栏功能"
-        );
-    }
-
-    #[test]
-    fn test_validate_extension_id_rejects_injection() {
-        assert!(
-            !validate_extension_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;"),
-            "含分号等特殊字符的ID应被拒绝，防止AppleScript/PowerShell命令注入"
-        );
-        assert!(
-            !validate_extension_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"),
-            "含 z 等非 a-p 字符的ID应被拒绝"
-        );
-    }
-
-    // 7. Extension ID 存读
-    #[test]
-    fn test_save_and_load_extension_id() {
-        let tmp = TempDir::new().expect("创建临时目录失败");
-        let config_file = tmp.path().join("config.json");
-        let id = "abcdefghijklmnopabcdefghijklmnop";
-        save_extension_id_to_file(&config_file, id).expect("保存扩展ID失败");
-        let loaded = load_extension_id_from_file(&config_file);
-        assert_eq!(
-            loaded,
-            Some(id.to_string()),
-            "扩展ID读取与保存不一致，会导致侧边栏功能无法使用"
-        );
-    }
-
-    #[test]
-    fn test_extension_id_does_not_overwrite_custom_path() {
-        let tmp = TempDir::new().expect("创建临时目录失败");
-        let config_file = tmp.path().join("config.json");
-        save_path_to_config_file(&config_file, "online", "/my/install")
-            .expect("保存路径失败");
-        save_extension_id_to_file(&config_file, "abcdefghijklmnopabcdefghijklmnop")
-            .expect("保存扩展ID失败");
-        let path = load_saved_path_from_file(&config_file, "online");
-        assert_eq!(
-            path,
-            Some("/my/install".to_string()),
-            "保存扩展ID不应覆盖已有安装路径配置，否则会导致更新功能异常"
-        );
-    }
-
-    // 8. Chrome 侧边栏命令构建
-    #[test]
-    fn test_build_macos_script_contains_extension_id() {
-        let id = "abcdefghijklmnopabcdefghijklmnop";
-        let script = build_chrome_sidebar_script_macos(id);
-        assert!(script.contains(id), "macOS AppleScript 应包含扩展ID");
-        assert!(
-            script.contains("sidepanel.html"),
-            "macOS AppleScript 应包含侧边栏页面路径"
-        );
-        assert!(
-            script.contains("Google Chrome"),
-            "macOS AppleScript 应包含 Google Chrome 应用名称"
-        );
-    }
-
-    #[test]
-    fn test_build_windows_command_contains_extension_id() {
-        let id = "abcdefghijklmnopabcdefghijklmnop";
-        let cmd = build_chrome_sidebar_command_windows(id);
-        assert!(cmd.contains(id), "Windows 命令应包含扩展ID");
-        assert!(
-            cmd.contains("sidepanel.html"),
-            "Windows 命令应包含侧边栏页面路径"
-        );
-        assert!(
-            cmd.contains("chrome.exe"),
-            "Windows 命令应包含 chrome.exe"
-        );
-    }
-
-    // 9. Chrome 标签页刷新脚本构建
+    // 6. Chrome 标签页刷新脚本构建
     #[test]
     fn test_build_macos_refresh_script_structure() {
         let script = build_refresh_all_tabs_script_macos();
@@ -846,5 +951,261 @@ mod tests {
             cmd.contains("Refresh"),
             "Windows 刷新命令应包含 Refresh 方法调用"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Task 1.1 常驻化：开机自启偏好持久化
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_autostart_defaults_to_disabled_when_config_missing() {
+        let config_file = PathBuf::from("/tmp/non_existent_autostart_98765/config.json");
+        assert_eq!(
+            load_autostart_from_file(&config_file),
+            false,
+            "配置缺失时开机自启必须默认关闭，否则会在用户未同意的情况下静默修改开机项"
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_autostart_enabled() {
+        let tmp = TempDir::new().expect("创建临时目录失败，会导致开机自启偏好测试无法运行");
+        let config_file = tmp.path().join("config.json");
+
+        save_autostart_to_file(&config_file, true)
+            .expect("保存开机自启偏好失败，会导致用户设置重启后丢失");
+
+        assert_eq!(
+            load_autostart_from_file(&config_file),
+            true,
+            "读取的自启偏好与保存值不一致，会导致托盘开关状态与实际行为不符"
+        );
+    }
+
+    #[test]
+    fn test_save_autostart_can_be_toggled_off() {
+        let tmp = TempDir::new().expect("创建临时目录失败，会导致开机自启偏好测试无法运行");
+        let config_file = tmp.path().join("config.json");
+
+        save_autostart_to_file(&config_file, true).expect("首次开启自启失败");
+        save_autostart_to_file(&config_file, false).expect("关闭自启失败");
+
+        assert_eq!(
+            load_autostart_from_file(&config_file),
+            false,
+            "关闭自启后仍读到开启状态，会导致用户无法真正关掉开机启动"
+        );
+    }
+
+    #[test]
+    fn test_save_autostart_preserves_existing_path() {
+        let tmp = TempDir::new().expect("创建临时目录失败，会导致配置共存测试无法运行");
+        let config_file = tmp.path().join("config.json");
+        let custom_path = "/custom/aichat";
+
+        save_path_to_config_file(&config_file, "online", custom_path).expect("保存路径失败");
+        save_autostart_to_file(&config_file, true).expect("保存自启偏好失败");
+
+        assert_eq!(
+            load_saved_path_from_file(&config_file, "online"),
+            Some(custom_path.to_string()),
+            "写入自启偏好后安装路径丢失，会导致用户已配置的安装目录被清空"
+        );
+        assert_eq!(
+            load_autostart_from_file(&config_file),
+            true,
+            "自启偏好未正确写入"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Task 1.2 本地 HTTP 服务：日志行格式化 / 级别归一 / 配置透传
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_log_line_contains_all_fields() {
+        let line = format_log_line(
+            "2026-07-29 10:30:00.123",
+            "error",
+            "background",
+            "robot-01",
+            "插件崩溃",
+        );
+        assert!(
+            line.contains("2026-07-29 10:30:00.123"),
+            "日志行必须含时间戳，否则无法定位问题发生时刻"
+        );
+        assert!(
+            line.contains("ERROR"),
+            "日志级别应大写输出，便于 grep 过滤异常"
+        );
+        assert!(
+            line.contains("background"),
+            "日志行必须含来源，否则无法区分是 background 还是 content script 报的错"
+        );
+        assert!(
+            line.contains("robot-01"),
+            "日志行必须含插件名，否则多台机器的日志混在一起无法区分是谁报的"
+        );
+        assert!(line.contains("插件崩溃"), "日志行必须含原始消息内容");
+    }
+
+    #[test]
+    fn test_format_log_line_field_order_is_ts_level_source_plugin_message() {
+        let line = format_log_line("ts", "info", "sidepanel", "robot-01", "消息内容");
+        assert_eq!(
+            line,
+            "[ts] [INFO] [sidepanel] [robot-01] 消息内容",
+            "字段顺序变动会导致 parse_log_line 解析错位，插件名必须作为第 4 个方括号字段"
+        );
+    }
+
+    #[test]
+    fn test_format_log_line_is_single_line_even_with_newlines_in_message() {
+        let line = format_log_line(
+            "2026-07-29 10:30:00.000",
+            "info",
+            "sidepanel",
+            "robot-01",
+            "第一行\n第二行",
+        );
+        assert_eq!(
+            line.matches('\n').count(),
+            0,
+            "消息内含换行时必须转义为单行，否则会破坏一行一条的格式、导致 AI 与 grep 解析错乱"
+        );
+        assert!(
+            line.contains("第一行") && line.contains("第二行"),
+            "转义换行不应丢失原始内容"
+        );
+    }
+
+    #[test]
+    fn test_normalize_log_level_maps_aliases() {
+        assert_eq!(normalize_log_level("warn"), "WARN");
+        assert_eq!(normalize_log_level("WARNING"), "WARN", "warning 应归一为 WARN，否则同类日志会分散在两种级别下");
+        assert_eq!(normalize_log_level("err"), "ERROR");
+        assert_eq!(normalize_log_level("error"), "ERROR");
+        assert_eq!(normalize_log_level("debug"), "DEBUG");
+        assert_eq!(normalize_log_level("info"), "INFO");
+    }
+
+    #[test]
+    fn test_normalize_log_level_falls_back_to_info_for_unknown() {
+        assert_eq!(
+            normalize_log_level("verbose"),
+            "INFO",
+            "未知级别应回落 INFO 而非丢弃，否则插件传入非约定级别时日志会静默消失"
+        );
+        assert_eq!(normalize_log_level(""), "INFO", "空级别应回落 INFO");
+    }
+
+    #[test]
+    fn test_is_error_level_only_true_for_error_and_warn() {
+        assert!(is_error_level("ERROR"), "ERROR 应计入异常日志");
+        assert!(is_error_level("WARN"), "WARN 应计入异常日志，供 AI 分析潜在问题");
+        assert!(!is_error_level("INFO"), "INFO 不应写入异常日志，否则异常文件被噪声淹没");
+        assert!(!is_error_level("DEBUG"), "DEBUG 不应计入异常");
+    }
+
+    #[test]
+    fn test_save_config_preserves_unknown_fields() {
+        let tmp = TempDir::new().expect("创建临时目录失败，会导致配置透传测试无法运行");
+        let config_file = tmp.path().join("config.json");
+        // 模拟其它程序写入的未知字段
+        fs::write(
+            &config_file,
+            r#"{"online_path":"/a","third_party_field":"keep-me"}"#,
+        )
+        .expect("预置配置文件失败");
+
+        save_autostart_to_file(&config_file, true).expect("保存自启偏好失败");
+
+        let content = fs::read_to_string(&config_file).expect("读取配置失败");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("配置应为合法 JSON");
+        assert_eq!(
+            parsed.get("third_party_field").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "写入配置时抹掉了其它程序的字段，会导致外部写入的数据静默丢失"
+        );
+        assert_eq!(
+            parsed.get("autostart").and_then(|v| v.as_bool()),
+            Some(true),
+            "自启偏好应正常写入"
+        );
+    }
+
+    #[test]
+    fn test_autostart_config_json_shape_is_valid() {
+        let tmp = TempDir::new().expect("创建临时目录失败，会导致配置格式测试无法运行");
+        let config_file = tmp.path().join("config.json");
+
+        save_autostart_to_file(&config_file, true).expect("保存自启偏好失败");
+
+        let content = fs::read_to_string(&config_file).expect("读取配置文件失败");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("配置文件不是合法 JSON，会导致后续读取全部失败");
+        assert_eq!(
+            parsed.get("autostart").and_then(|v| v.as_bool()),
+            Some(true),
+            "配置中应存在布尔字段 autostart，字段名变动会导致旧版本配置无法识别"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 客户端自身错误日志：打包后 stderr 无人接收，需落盘（复用 FileSink）
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_client_error_line_contains_client_source_and_error_level() {
+        let line = build_client_error_line("打开日志目录失败: 权限不足");
+        assert!(
+            line.contains("[ERROR]"),
+            "客户端自身错误应标记为 ERROR 级别，否则不会进入异常日志文件"
+        );
+        assert!(
+            line.contains("[client]"),
+            "来源应标注为 client，与插件转发的 background/sidepanel 等区分开"
+        );
+        assert!(
+            line.contains("[client]") && line.matches("[client]").count() == 2,
+            "插件名也应固定填 client，与来源字段语义一致，且日志查看页筛选插件名时能找到客户端自身日志"
+        );
+        assert!(
+            line.contains("打开日志目录失败"),
+            "应保留原始错误信息，否则排查时丢失具体原因"
+        );
+    }
+
+    #[test]
+    fn test_log_client_error_writes_to_registered_sink() {
+        struct MemSink {
+            lines: std::sync::Mutex<Vec<(String, bool)>>,
+        }
+        impl log_server::LogSink for MemSink {
+            fn write_line(&self, line: &str, is_error: bool) {
+                self.lines.lock().unwrap().push((line.to_string(), is_error));
+            }
+        }
+        let sink = std::sync::Arc::new(MemSink {
+            lines: std::sync::Mutex::new(Vec::new()),
+        });
+        // OnceLock 进程内只能设置一次；此测试独占 LOG_SINK 的首次写入验证
+        let is_first_set = LOG_SINK.set(sink.clone() as std::sync::Arc<dyn log_server::LogSink>).is_ok();
+        if !is_first_set {
+            // 其它测试已抢先设置过（理论上不会，因本文件只有此处调用 set），跳过避免误判
+            return;
+        }
+
+        log_client_error("测试错误消息");
+
+        let lines = sink.lines.lock().unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "已注册 sink 时应写入其中，而非回落 eprintln!，否则打包后仍然看不到"
+        );
+        assert!(lines[0].1, "客户端自身错误应标记为异常，进入 aichat-error-*.log");
+        assert!(lines[0].0.contains("测试错误消息"));
     }
 }
