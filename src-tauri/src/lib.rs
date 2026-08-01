@@ -6,6 +6,7 @@ use tauri::Manager;
 
 pub mod log_file;
 pub mod log_server;
+pub mod updater_manifest;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateInfo {
@@ -426,6 +427,13 @@ fn get_log_server_port() -> u16 {
     LOG_SERVER_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 记录更新器自身的自动更新失败。
+/// 自更新失败对采购同事既看不懂也无从处理，故前端不弹错，改为落盘由排查者查看
+#[tauri::command]
+fn log_self_update_error(message: String) {
+    log_client_error(&format!("自动更新失败: {}", message));
+}
+
 /// 获取开机自启偏好，供前端/托盘菜单回显开关状态
 #[tauri::command]
 fn get_autostart() -> bool {
@@ -651,6 +659,11 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 桌面端自更新：十几台采购虚拟机不可能逐台手动替换程序文件，
+        // 由常驻进程定时拉取 latest.json 静默升级自身
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // 供更新安装完成后重启应用
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             build_tray(app.handle())?;
             // 日志服务启动失败不阻断应用：更新功能仍应可用，仅退化为不收集日志
@@ -688,6 +701,7 @@ pub fn run() {
             set_autostart,
             open_log_dir,
             get_log_server_port,
+            log_self_update_error,
             list_log_dates,
             read_log_entries,
         ])

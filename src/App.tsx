@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 type Env = "online" | "test";
@@ -36,6 +38,16 @@ type View = "update" | "logs";
 
 const ALL_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"];
 
+/// 自更新检查间隔：4 小时。采购机器常整天开着，间隔太短徒增站点请求，
+/// 太长则当天发的修复版当天到不了。
+const SELF_UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
+/// 更新器自身的更新状态
+type SelfUpdateState =
+  | { kind: "idle" }
+  | { kind: "downloading"; version: string }
+  | { kind: "ready"; version: string };
+
 function App() {
   const [view, setView] = useState<View>("update");
   const [activeEnv, setActiveEnv] = useState<Env>("online");
@@ -59,6 +71,40 @@ function App() {
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logLoading, setLogLoading] = useState<boolean>(false);
   const [logError, setLogError] = useState<string>("");
+
+  // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
+  const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
+
+  // 启动时检查一次，之后每 4 小时一次。下载在后台完成，
+  // 但不自动重启——用户可能正在跑插件更新，中途重启会打断操作，
+  // 改为下载完提示、由用户点「立即重启」或下次启动时自然生效。
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkSelfUpdate() {
+      try {
+        const update = await check();
+        if (!update || cancelled) return;
+
+        setSelfUpdate({ kind: "downloading", version: update.version });
+        await update.downloadAndInstall();
+        if (cancelled) return;
+        setSelfUpdate({ kind: "ready", version: update.version });
+      } catch (e) {
+        // 自更新失败不打扰用户：采购同事看到红色报错既看不懂也无从处理。
+        // 写进日志文件，由排查者从日志页查看。
+        console.error("自动更新检查失败:", e);
+        invoke("log_self_update_error", { message: String(e) }).catch(() => {});
+      }
+    }
+
+    checkSelfUpdate();
+    const timer = setInterval(checkSelfUpdate, SELF_UPDATE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     setStatus("");
@@ -259,6 +305,21 @@ function App() {
           日志查看
         </button>
       </div>
+
+      {selfUpdate.kind !== "idle" && (
+        <div className="self-update-bar">
+          {selfUpdate.kind === "downloading" ? (
+            <span>正在后台下载新版本 {selfUpdate.version}…</span>
+          ) : (
+            <>
+              <span>新版本 {selfUpdate.version} 已就绪，重启后生效</span>
+              <button className="self-update-btn" onClick={() => relaunch()}>
+                立即重启
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       {view === "logs" ? (
         <div className="log-view">

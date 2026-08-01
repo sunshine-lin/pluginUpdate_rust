@@ -34,7 +34,10 @@ jobs:
       - name: Build Windows
         run: npm run tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ""
+          # 自更新签名私钥。未配置时构建仍能出包，但不会产出 .sig，
+          # 下面生成清单一步会失败——避免发布一份客户端验签装不上的更新
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: List bundle output
         shell: powershell
@@ -44,6 +47,32 @@ jobs:
           } else {
             Write-Host "bundle directory not found"
           }
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          node scripts/generate-latest-json.cjs \
+            src-tauri/target/release/bundle/nsis \
+            "$VERSION" \
+            "https://chainai.cjdropshipping.cn/updater" \
+            dist-updater/latest.json \
+            "aichat Updater $VERSION"
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe dist-updater/
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe.sig dist-updater/
+
+      # TODO(待确认上传方式): dist-updater/ 下已是可直接发布的三个文件
+      #   latest.json / *-setup.exe / *-setup.exe.sig
+      # 需确认 chainai.cjdropshipping.cn 的文件发布方式（OSS? rsync? 运维手动?）
+      # 后补一步自动上传；在此之前从下面的 artifact 下载后手动放到站点 /updater/ 目录。
+
+      - name: Upload updater artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-release
+          path: dist-updater/*
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
