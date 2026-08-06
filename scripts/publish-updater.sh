@@ -39,11 +39,17 @@ info() { echo "[publish-updater] $*"; }
 command -v curl >/dev/null || die "缺少 curl"
 command -v unzip >/dev/null || die "缺少 unzip"
 command -v node >/dev/null || die "缺少 node（生成 latest.json 需要）"
-command -v npx >/dev/null || die "缺少 npx（tauri signer 签名需要）"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 GEN_SCRIPT="$SCRIPT_DIR/generate-latest-json.cjs"
 [ -f "$GEN_SCRIPT" ] || die "找不到 $GEN_SCRIPT"
+
+# tauri CLI 必须从项目目录解析：npx 只在当前目录的 node_modules 里找命令，
+# 在别处执行会报 "could not determine executable to run"（实测踩过）。
+# 直接用 node_modules/.bin 下的可执行文件，不依赖调用方的当前目录。
+TAURI_BIN="$PROJECT_DIR/node_modules/.bin/tauri"
+[ -x "$TAURI_BIN" ] || die "找不到 tauri CLI: $TAURI_BIN（在项目目录执行 npm ci 后重试）"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -72,8 +78,10 @@ SETUP_EXE="$(find "$WORK_DIR/stage" -maxdepth 1 -name '*-setup.exe' -print -quit
 info "取得安装包: $(basename "$SETUP_EXE")"
 
 # ── 2. 签名（产出同名 .sig，供下一步读取）─────────────────────
+# 密钥有密码时必须提供 TAURI_SIGNING_PRIVATE_KEY_PASSWORD，
+# 否则 CLI 会尝试交互式读取，在无 tty 的服务器上直接失败（os error 6）
 info "签名 ..."
-npx tauri signer sign -f "$PRIVATE_KEY_PATH" "$SETUP_EXE" >/dev/null \
+"$TAURI_BIN" signer sign -f "$PRIVATE_KEY_PATH" "$SETUP_EXE" >/dev/null \
   || die "签名失败（私钥或 TAURI_SIGNING_PRIVATE_KEY_PASSWORD 不正确？）"
 [ -f "$SETUP_EXE.sig" ] || die "签名后未生成 $SETUP_EXE.sig"
 
