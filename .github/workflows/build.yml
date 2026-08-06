@@ -31,8 +31,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # 签名在构建时完成：配置了 pubkey + createUpdaterArtifacts 后，
+      # tauri 会在打包阶段直接签名并产出 .sig，拿不到私钥就直接构建失败
+      # （实测：A public key has been found, but no private key）。
+      # 故私钥必须在此可用，不能挪到构建之后再补签。
       - name: Build Windows
         run: npm run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: List bundle output
         shell: powershell
@@ -43,15 +50,13 @@ jobs:
             Write-Host "bundle directory not found"
           }
 
-      # 只产出未签名安装包。签名与 latest.json 生成都在服务器上完成
-      # （scripts/publish-updater.sh）——私钥只存服务器，不进 GitHub Secret。
-      # 签名是纯 minisign 校验文件字节、与操作系统无关，故可与编译分离；
-      # 编译则必须留在 Windows（NSIS 安装器无法在 Linux 产出）。
-      - name: Collect unsigned installer
+      # 收集已签名的安装包与签名文件，供服务器发布脚本取用
+      - name: Collect signed installer
         shell: bash
         run: |
           mkdir -p dist-updater
           cp src-tauri/target/release/bundle/nsis/*-setup.exe dist-updater/
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe.sig dist-updater/
 
       - name: Upload updater artifacts
         uses: actions/upload-artifact@v4
@@ -96,6 +101,10 @@ jobs:
 
       - name: Build macOS
         run: npm run tauri build
+        env:
+          # 同 Windows：配了 pubkey 后构建阶段就要签名，缺私钥直接失败
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: List bundle output
         run: find src-tauri/target/release/bundle -type f 2>/dev/null || echo "bundle dir not found"
