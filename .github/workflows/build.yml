@@ -39,7 +39,10 @@ jobs:
         run: npm run tauri build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 必须显式给空串。密钥无密码时若该变量未定义，CLI 会尝试交互式
+          # 读取密码，在无 tty 的 CI 里报 os error 6 导致构建失败（已实测）。
+          # 用 || '' 兜底，避免依赖「必须存在一个空值 secret」这种易漏配置
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
 
       - name: List bundle output
         shell: powershell
@@ -102,9 +105,10 @@ jobs:
       - name: Build macOS
         run: npm run tauri build
         env:
-          # 同 Windows：配了 pubkey 后构建阶段就要签名，缺私钥直接失败
+          # 同 Windows：配了 pubkey 后构建阶段就要签名，缺私钥直接失败；
+          # 密码变量未定义会触发交互式读取，故显式给空串兜底
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
 
       - name: List bundle output
         run: find src-tauri/target/release/bundle -type f 2>/dev/null || echo "bundle dir not found"
