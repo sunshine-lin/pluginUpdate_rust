@@ -11,11 +11,14 @@
 # 因此私钥必须存在 CI（GitHub Secret），产物到达本机时已带签名。
 #
 # 用法:
-#   export GITHUB_TOKEN=ghp_xxx                       # 需 actions:read 权限
 #   ./publish-updater.sh <发布目录> [仓库]
 #
+# 凭证（二选一，优先环境变量）:
+#   ~/.config/updater/gh-token    需 repo 权限，chmod 600
+#   GITHUB_TOKEN=xxx              临时覆盖用
+#
 # 示例:
-#   ./publish-updater.sh /usr/share/nginx/www/updater
+#   ./publish-updater.sh ../pms-aichat/public/updater
 #
 set -euo pipefail
 
@@ -30,7 +33,15 @@ info() { echo "[publish-updater] $*"; }
 
 [ -n "$PUBLISH_DIR" ] || die "用法: $0 <发布目录> [仓库]"
 [ -d "$PUBLISH_DIR" ] || die "发布目录不存在: $PUBLISH_DIR"
-[ -n "${GITHUB_TOKEN:-}" ] || die "需设置 GITHUB_TOKEN（actions:read 权限）"
+
+# token 优先取环境变量，其次读凭证文件。放文件是为了让发布真正做到「一条命令」——
+# 每次发版都要先 export 一遍，既容易忘，也容易在复制粘贴时泄露到别处
+TOKEN_FILE="${GITHUB_TOKEN_FILE:-$HOME/.config/updater/gh-token}"
+if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$TOKEN_FILE" ]; then
+  # 去掉可能的换行/空白：粘贴时常带上，带进 HTTP 头会导致 401
+  GITHUB_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+fi
+[ -n "${GITHUB_TOKEN:-}" ] || die "缺少凭证。把 GitHub token（需 repo 权限）写入 $TOKEN_FILE，或设 GITHUB_TOKEN 环境变量"
 
 command -v curl >/dev/null || die "缺少 curl"
 command -v unzip >/dev/null || die "缺少 unzip"
