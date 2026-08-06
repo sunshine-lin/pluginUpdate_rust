@@ -44,7 +44,12 @@ pub struct LogEntry {
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
-    /// 客户端版本，供插件判断兼容性
+    /// 客户端版本，供插件判断兼容性。
+    ///
+    /// 取值必须与 updater 比对所用的版本同源（`tauri.conf.json` 的 version，
+    /// 经 `app.package_info().version` 取得），故由调用方注入而非在此读
+    /// `CARGO_PKG_VERSION`——后者是 Cargo.toml 的版本，两者不同步时会出现
+    /// 「程序实际跑新版、对外自报旧版」，排查时被自己的日志误导。
     version: String,
 }
 
@@ -71,12 +76,14 @@ impl LogSink for StdoutSink {
 #[derive(Clone)]
 struct AppState {
     sink: Arc<dyn LogSink>,
+    /// 对外自报的客户端版本，由调用方从 `app.package_info().version` 注入
+    version: String,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: state.version.clone(),
     })
 }
 
@@ -100,22 +107,31 @@ async fn ingest_log(
     (StatusCode::OK, Json(LogAck { received: count }))
 }
 
-fn build_router(sink: Arc<dyn LogSink>) -> Router {
+fn build_router(sink: Arc<dyn LogSink>, version: &str) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/log", post(ingest_log))
-        .with_state(AppState { sink })
+        .with_state(AppState {
+            sink,
+            version: version.to_string(),
+        })
 }
 
 /// 在后台线程启动日志服务，返回实际绑定的端口。
 /// 绑定失败（端口全被占用）时返回 Err，调用方应降级为「不收集日志」而非阻断启动
-pub fn spawn(sink: Arc<dyn LogSink>) -> Result<u16, String> {
+///
+/// # Arguments
+/// * `sink` - 日志写入策略
+/// * `version` - 对外自报的客户端版本，须传 `app.package_info().version`，
+///   与 updater 比对所用版本同源
+pub fn spawn(sink: Arc<dyn LogSink>, version: &str) -> Result<u16, String> {
     let listener = bind_loopback()?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("读取监听地址失败: {}", e))?
         .port();
 
+    let version = version.to_string();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -138,7 +154,7 @@ pub fn spawn(sink: Arc<dyn LogSink>) -> Result<u16, String> {
                     return;
                 }
             };
-            if let Err(e) = axum::serve(listener, build_router(sink)).await {
+            if let Err(e) = axum::serve(listener, build_router(sink, &version)).await {
                 eprintln!("日志服务异常退出: {}", e);
             }
         });
@@ -248,6 +264,7 @@ mod tests {
         let (status, ack) = ingest_log(
             State(AppState {
                 sink: sink.clone() as Arc<dyn LogSink>,
+                version: "0.0.0-test".into(),
             }),
             Json(entries),
         )
@@ -285,6 +302,7 @@ mod tests {
         let (status, _) = ingest_log(
             State(AppState {
                 sink: sink.clone() as Arc<dyn LogSink>,
+                version: "0.0.0-test".into(),
             }),
             Json(entries),
         )
@@ -300,6 +318,33 @@ mod tests {
         assert!(
             lines[0].0.contains("INFO") && lines[0].0.contains("unknown"),
             "缺失的级别/来源应回落为 INFO/unknown 而非丢弃该条"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_injected_version_not_cargo_version() {
+        // 版本必须由调用方注入（来自 tauri.conf.json，与 updater 比对同源）。
+        // 若此处退回 env!("CARGO_PKG_VERSION")，当两个文件版本不同步时
+        // 会出现「实际跑新版、对外自报旧版」，排查时被自己的日志误导
+        let sink = Arc::new(MemSink {
+            lines: Mutex::new(Vec::new()),
+        });
+        let injected = "9.9.9-injected";
+        let resp = health(State(AppState {
+            sink: sink as Arc<dyn LogSink>,
+            version: injected.into(),
+        }))
+        .await;
+
+        assert!(resp.ok, "健康检查应返回 ok=true");
+        assert_eq!(
+            resp.version, injected,
+            "/health 应回报注入的版本；返回 Cargo.toml 版本会与 updater 实际比对的版本脱节"
+        );
+        assert_ne!(
+            resp.version,
+            env!("CARGO_PKG_VERSION"),
+            "本测试注入了与 Cargo 版本不同的值，若相等说明实现仍在读 CARGO_PKG_VERSION"
         );
     }
 }

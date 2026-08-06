@@ -421,6 +421,30 @@ pub fn log_client_error(message: &str) {
     }
 }
 
+/// 构建客户端自身普通信息的日志行（可测试的纯函数部分）
+pub fn build_client_info_line(message: &str) -> String {
+    format_log_line(&current_timestamp(), "info", "client", "client", message)
+}
+
+/// 记录客户端自身的普通信息（非异常）。
+/// 与 `log_client_error` 的区别是不写入异常文件，避免污染「仅异常」视图
+pub fn log_client_info(message: &str) {
+    let line = build_client_info_line(message);
+    match LOG_SINK.get() {
+        Some(sink) => sink.write_line(&line, false),
+        None => println!("{}", line),
+    }
+}
+
+/// 构建启动版本上报的日志消息。
+///
+/// 十几台采购机器的日志汇总在一起时，靠这条判断每台各自跑的是哪个版本。
+/// 自更新失败为静默设计，没有这条就无法发现某台卡在旧版没升上来。
+/// 前缀固定为「客户端启动」，便于按关键词筛出各机器的版本分布
+pub fn build_startup_version_line(version: &str) -> String {
+    format!("客户端启动，版本 {}", version)
+}
+
 /// 获取日志服务端口，供前端展示与插件侧发现（0 表示服务未启动）
 #[tauri::command]
 fn get_log_server_port() -> u16 {
@@ -666,11 +690,18 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             build_tray(app.handle())?;
+            // 版本号取自 tauri.conf.json（package_info 的来源），与 updater 比对所用版本同源。
+            // 不用 CARGO_PKG_VERSION —— 那是 Cargo.toml 的版本，两者不同步时会出现
+            // 「实际跑新版、对外自报旧版」，排查时被自己的日志误导
+            let app_version = app.package_info().version.to_string();
             // 日志服务启动失败不阻断应用：更新功能仍应可用，仅退化为不收集日志
             let sink: std::sync::Arc<dyn log_server::LogSink> =
                 std::sync::Arc::new(log_file::FileSink::new(get_log_dir()));
             let _ = LOG_SINK.set(sink.clone());
-            match log_server::spawn(sink) {
+            // 启动即记录自身版本：自更新失败是静默的（采购同事看到报错也无从处理），
+            // 没有这条日志就无法判断十几台机器里谁卡在旧版没升上来
+            log_client_info(&build_startup_version_line(&app_version));
+            match log_server::spawn(sink, &app_version) {
                 Ok(port) => {
                     LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
                     println!(
@@ -1221,5 +1252,44 @@ mod tests {
         );
         assert!(lines[0].1, "客户端自身错误应标记为异常，进入 aichat-error-*.log");
         assert!(lines[0].0.contains("测试错误消息"));
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 启动版本上报：自更新失败为静默设计，靠这条判断哪台机器没升上来
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_startup_version_line_contains_version() {
+        let msg = build_startup_version_line("0.2.0");
+        assert!(
+            msg.contains("0.2.0"),
+            "启动日志必须含版本号，否则无法判断十几台机器里谁卡在旧版：{}",
+            msg
+        );
+        assert!(
+            msg.contains("客户端启动"),
+            "需含固定前缀，便于在日志查看页按关键词筛出各机器的版本分布：{}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_build_client_info_line_is_info_level_not_error() {
+        let line = build_client_info_line("客户端启动，版本 0.2.0");
+        assert!(
+            line.contains("[INFO]"),
+            "启动上报是普通信息而非异常，标成 ERROR 会污染「仅异常」视图：{}",
+            line
+        );
+        assert!(
+            line.contains("[client]"),
+            "来源应标注 client，与插件转发的日志区分开：{}",
+            line
+        );
+        assert!(
+            !line.contains("[ERROR]"),
+            "不应出现 ERROR 级别：{}",
+            line
+        );
     }
 }

@@ -40,15 +40,21 @@ if (!setupExe) {
 
 const sigFile = `${setupExe}.sig`;
 if (!files.includes(sigFile)) {
-  // 缺签名说明构建时没拿到私钥。此时若照常生成清单，客户端会因验签失败
-  // 静默拒绝更新——宁可让 CI 在这里失败，也不要发布一份装不上的更新。
+  // 缺签名说明签名步骤没跑或失败。此时若照常生成清单，客户端会因验签失败
+  // 静默拒绝更新——宁可在这里失败，也不要发布一份装不上的更新。
   fail(
     `未找到签名文件 ${sigFile}。\n` +
-      `请确认 CI 设置了 TAURI_SIGNING_PRIVATE_KEY（及密码 TAURI_SIGNING_PRIVATE_KEY_PASSWORD）。`
+      `签名由 scripts/publish-updater.sh 在服务器上执行（tauri signer sign），\n` +
+      `请确认私钥路径与 TAURI_SIGNING_PRIVATE_KEY_PASSWORD 配置正确。`
   );
 }
 
 const signature = fs.readFileSync(path.join(bundleDir, sigFile), "utf8").trim();
+
+// 文件名需转义后再拼进 URL：productName 是「aichat Updater」（含空格），
+// 直接拼出的地址带裸空格，客户端请求会直接失败（实测 curl 无法发出该请求）。
+// 只转义文件名本身，不动 baseUrl 的斜杠。
+const encodedName = encodeURIComponent(setupExe);
 
 const manifest = {
   version,
@@ -57,7 +63,7 @@ const manifest = {
   platforms: {
     "windows-x86_64": {
       signature,
-      url: `${baseUrl.replace(/\/+$/, "")}/${setupExe}`,
+      url: `${baseUrl.replace(/\/+$/, "")}/${encodedName}`,
     },
   },
 };
