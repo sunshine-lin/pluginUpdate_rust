@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod log_file;
 pub mod log_server;
@@ -756,6 +756,8 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let log_item = MenuItem::with_id(app, "open_log", "打开日志目录", true, None::<&str>)?;
+    // 不必等 4 小时的轮询：发版后想立刻让某台机器升级时用
+    let check_item = MenuItem::with_id(app, "check_update", "立即检查更新", true, None::<&str>)?;
     let autostart_item = CheckMenuItem::with_id(
         app,
         "toggle_autostart",
@@ -770,6 +772,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         &[
             &show_item,
             &log_item,
+            &check_item,
             &PredefinedMenuItem::separator(app)?,
             &autostart_item,
             &PredefinedMenuItem::separator(app)?,
@@ -795,6 +798,12 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         })
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
+            // 检查逻辑在前端（updater 插件的 JS API），故这里只发事件通知；
+            // 同时唤回窗口，否则用户看不到「已是最新版本」之类的反馈
+            "check_update" => {
+                show_main_window(app);
+                let _ = app.emit("tray://check-update", ());
+            }
             "open_log" => {
                 if let Err(e) = open_log_dir() {
                     log_client_error(&format!("打开日志目录失败: {}", e));

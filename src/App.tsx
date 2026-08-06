@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -42,11 +44,18 @@ const ALL_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"];
 /// 太长则当天发的修复版当天到不了。
 const SELF_UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
+/// 轮询是否已启动。模块级而非组件 state：StrictMode 下 effect 跑两遍，
+/// 用 state 无法在第二次执行时读到第一次的结果（闭包捕获的是旧值）
+let selfUpdateStarted = false;
+
+/// 上一次记录过的自更新错误，用于抑制重复日志（见 runSelfUpdateCheck）
+let lastSelfUpdateError: string | null = null;
+
 /// 更新器自身的更新状态
 type SelfUpdateState =
   | { kind: "idle" }
   | { kind: "downloading"; version: string }
-  | { kind: "ready"; version: string };
+  | { kind: "ready"; version: string; notes: string };
 
 function App() {
   const [view, setView] = useState<View>("update");
@@ -74,37 +83,85 @@ function App() {
 
   // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
   const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
+  // 当前程序版本，显示在界面上——此前只能翻日志确认，排查十几台机器时很不方便
+  const [appVersion, setAppVersion] = useState<string>("");
+  // 手动检查更新的状态与反馈（自动轮询不产生这些提示）
+  const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
+  const [selfUpdateHint, setSelfUpdateHint] = useState<string>("");
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
+  // 托盘「立即检查更新」走事件通知：检查逻辑在前端，托盘只负责触发。
+  // 与下面的轮询分开注册——轮询有防重入标志、注册一次即可，
+  // 而监听必须每次挂载都注册，否则 StrictMode 第二次执行时会漏挂
+  useEffect(() => {
+    const unlisten = listen("tray://check-update", () => runSelfUpdateCheck("manual"));
+    return () => {
+      unlisten.then((f) => f()).catch(() => {});
+    };
+  }, []);
 
   // 启动时检查一次，之后每 4 小时一次。下载在后台完成，
   // 但不自动重启——用户可能正在跑插件更新，中途重启会打断操作，
   // 改为下载完提示、由用户点「立即重启」或下次启动时自然生效。
   useEffect(() => {
-    let cancelled = false;
+    // StrictMode 下 effect 会执行两遍。仅靠 cancelled 标志能挡住状态更新，
+    // 但挡不住已经发出的网络请求与日志——实测每次启动会重复记两条。
+    // 用模块级标志保证同一进程内只启动一套轮询。
+    if (selfUpdateStarted) return;
+    selfUpdateStarted = true;
 
-    async function checkSelfUpdate() {
-      try {
-        const update = await check();
-        if (!update || cancelled) return;
-
-        setSelfUpdate({ kind: "downloading", version: update.version });
-        await update.downloadAndInstall();
-        if (cancelled) return;
-        setSelfUpdate({ kind: "ready", version: update.version });
-      } catch (e) {
-        // 自更新失败不打扰用户：采购同事看到红色报错既看不懂也无从处理。
-        // 写进日志文件，由排查者从日志页查看。
-        console.error("自动更新检查失败:", e);
-        invoke("log_self_update_error", { message: String(e) }).catch(() => {});
-      }
-    }
-
-    checkSelfUpdate();
-    const timer = setInterval(checkSelfUpdate, SELF_UPDATE_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
+    runSelfUpdateCheck("auto");
+    const timer = setInterval(() => runSelfUpdateCheck("auto"), SELF_UPDATE_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, []);
+
+  /// 执行一次自更新检查。
+  /// trigger 为 "manual" 时会把结果反馈到界面（采购同事点了按钮需要看到回应），
+  /// "auto" 时保持安静——后台轮询不应打扰正在干活的人。
+  async function runSelfUpdateCheck(trigger: "auto" | "manual") {
+    if (checkingUpdate) return; // 防止连点或与轮询重入
+    setCheckingUpdate(true);
+    if (trigger === "manual") setSelfUpdateHint("正在检查更新…");
+    try {
+      const update = await check();
+      lastSelfUpdateError = null; // 本次成功，解除同错误抑制
+      if (!update) {
+        if (trigger === "manual") setSelfUpdateHint("已是最新版本");
+        return;
+      }
+      setSelfUpdateHint("");
+      setSelfUpdate({ kind: "downloading", version: update.version });
+      await update.downloadAndInstall();
+      // body 来自 latest.json 的 notes 字段，用于告知这次更新改了什么；
+      // 缺失时不显示说明，但不影响升级本身
+      setSelfUpdate({
+        kind: "ready",
+        version: update.version,
+        notes: (update.body ?? "").trim(),
+      });
+    } catch (e) {
+      const msg = String(e);
+      if (trigger === "manual") setSelfUpdateHint("检查更新失败，请稍后再试");
+      // 当前平台不在清单里属正常情况（只发布 Windows 包），不是故障：
+      // 记成 ERROR 会污染「仅异常」视图，且每轮必然复现、长期累积
+      const isPlatformMissing = msg.includes("were found in the response");
+      // 同一错误连续出现时只记一次——某台机器长期断网时，
+      // 每 4 小时记一条相同内容，一个月会攒出上百条无用日志
+      const isRepeat = msg === lastSelfUpdateError;
+      if (!isPlatformMissing && !isRepeat) {
+        lastSelfUpdateError = msg;
+        // 自更新失败不弹错打扰用户：采购同事看到红色报错既看不懂也无从处理。
+        // 写进日志文件，由排查者从日志页查看。
+        invoke("log_self_update_error", { message: msg }).catch(() => {});
+      }
+      console.error("自动更新检查失败:", e);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
 
   useEffect(() => {
     setStatus("");
@@ -304,7 +361,23 @@ function App() {
         >
           日志查看
         </button>
+        {/* 当前版本常驻显示：排查多台机器时不必再去翻日志 */}
+        {appVersion && (
+          <span className="app-version">
+            <button
+              className="check-update-btn"
+              onClick={() => runSelfUpdateCheck("manual")}
+              disabled={checkingUpdate}
+              title="立即检查是否有新版本"
+            >
+              {checkingUpdate ? "检查中…" : "检查更新"}
+            </button>
+            v{appVersion}
+          </span>
+        )}
       </div>
+
+      {selfUpdateHint && <div className="self-update-hint">{selfUpdateHint}</div>}
 
       {selfUpdate.kind !== "idle" && (
         <div className="self-update-bar">
@@ -312,7 +385,12 @@ function App() {
             <span>正在后台下载新版本 {selfUpdate.version}…</span>
           ) : (
             <>
-              <span>新版本 {selfUpdate.version} 已就绪，重启后生效</span>
+              <div className="self-update-text">
+                <span>新版本 {selfUpdate.version} 已就绪，重启后生效</span>
+                {selfUpdate.notes && (
+                  <span className="self-update-notes">{selfUpdate.notes}</span>
+                )}
+              </div>
               <button className="self-update-btn" onClick={() => relaunch()}>
                 立即重启
               </button>

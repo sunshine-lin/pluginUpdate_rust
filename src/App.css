@@ -70,6 +70,47 @@
   gap: 32px;
   margin-bottom: 20px;
   border-bottom: 1px solid #e0e0e6;
+  position: relative;
+}
+
+/* 版本号靠右绝对定位：不占据流内空间，标签仍保持整体居中 */
+.app-version {
+  position: absolute;
+  right: 0;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #999;
+  user-select: text;
+}
+
+.check-update-btn {
+  background: transparent;
+  border: 1px solid #d0d0d8;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #667eea;
+  cursor: pointer;
+}
+
+.check-update-btn:hover:not(:disabled) {
+  background-color: #eef1fd;
+}
+
+.check-update-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* 手动检查的一次性反馈，只在点了按钮后出现 */
+.self-update-hint {
+  text-align: center;
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 12px;
 }
 
 .view-tab-btn {
@@ -115,6 +156,20 @@
   background-color: #eef1fd;
   color: #3f51b5;
   font-size: 13px;
+}
+
+.self-update-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 更新说明：字号更小、颜色更淡，从属于上面那行主提示 */
+.self-update-notes {
+  font-size: 12px;
+  opacity: 0.75;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .self-update-btn {
@@ -779,5 +834,22 @@
   .self-update-bar {
     background-color: #262a45;
     color: #9fa8da;
+  }
+
+  .app-version {
+    color: #6a6a7a;
+  }
+
+  .check-update-btn {
+    border-color: #3a3a4e;
+    color: #9fa8da;
+  }
+
+  .check-update-btn:hover:not(:disabled) {
+    background-color: #262a45;
+  }
+
+  .self-update-hint {
+    color: #999;
   }
 }

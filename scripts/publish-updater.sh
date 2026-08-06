@@ -77,12 +77,25 @@ VERSION="$(basename "$SETUP_EXE" | sed -E 's/.*_([0-9]+\.[0-9]+\.[0-9]+)_.*/\1/'
 [ -n "$VERSION" ] || die "无法从文件名解析版本号: $(basename "$SETUP_EXE")"
 info "版本: $VERSION"
 
+# 更新说明取自 CHANGELOG.md 对应版本段落——这段文字会显示给采购同事看，
+# 写在仓库里可随代码一起评审，不必发布时现敲。取不到时回落为版本号本身，
+# 只是界面上不显示说明，不影响升级
+NOTES="$(node "$SCRIPT_DIR/extract-notes.cjs" "$SCRIPT_DIR/../CHANGELOG.md" "$VERSION")"
+
+if [ -n "$NOTES" ]; then
+  info "更新说明:"
+  printf '%s\n' "$NOTES" | sed 's/^/    /'
+else
+  NOTES="aichat Updater $VERSION"
+  info "CHANGELOG.md 中没有 $VERSION 的段落，界面将不显示更新说明"
+fi
+
 node "$GEN_SCRIPT" \
   "$WORK_DIR/stage" \
   "$VERSION" \
   "$BASE_URL" \
   "$WORK_DIR/stage/latest.json" \
-  "aichat Updater $VERSION" >/dev/null || die "生成 latest.json 失败"
+  "$NOTES" >/dev/null || die "生成 latest.json 失败"
 
 # ── 3. 原子落盘 ─────────────────────────────────────────────────
 # 逐个 mv 而非先删后拷：客户端可能正好在这一刻拉取，
