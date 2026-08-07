@@ -133,6 +133,28 @@ function App() {
         return;
       }
       setSelfUpdateHint("");
+      // 先确认清单里有当前系统的包，再进入下载状态。
+      // 否则在只发布 Windows 包的情况下，macOS 上会先切成「正在下载」
+      // 再抛错——用户看到的是永远转不完的下载提示。
+      //
+      // 清单的平台键形如 windows-x86_64 / darwin-aarch64，前缀即系统名。
+      // 只按前缀做保守判断：一个都不沾边时才跳过，避免误判导致该升的没升
+      const platforms = Object.keys(
+        (update.rawJson?.platforms ?? {}) as Record<string, unknown>
+      );
+      const osPrefix = navigator.userAgent.includes("Windows")
+        ? "windows"
+        : navigator.userAgent.includes("Mac")
+          ? "darwin"
+          : "";
+      const hasPlatform =
+        platforms.length === 0 || // 清单没声明平台，交给插件自行处理
+        !osPrefix ||              // 认不出系统，不擅自跳过
+        platforms.some((k) => k.startsWith(osPrefix));
+      if (!hasPlatform) {
+        if (trigger === "manual") setSelfUpdateHint("当前系统暂无更新包");
+        return;
+      }
       setSelfUpdate({ kind: "downloading", version: update.version });
       await update.downloadAndInstall();
       // body 来自 latest.json 的 notes 字段，用于告知这次更新改了什么；
@@ -144,7 +166,11 @@ function App() {
       });
     } catch (e) {
       const msg = String(e);
-      if (trigger === "manual") setSelfUpdateHint("检查更新失败，请稍后再试");
+      // 下载/安装失败必须把界面状态收回来。否则提示条会永远停在
+      // 「正在后台下载…」——既不报错也不消失，比直接说失败更让人困惑。
+      // 断网、站点 502、磁盘满都会走到这里，不只是平台不匹配
+      setSelfUpdate({ kind: "idle" });
+      if (trigger === "manual") setSelfUpdateHint("更新失败，请稍后再试");
       // 当前平台不在清单里属正常情况（只发布 Windows 包），不是故障：
       // 记成 ERROR 会污染「仅异常」视图，且每轮必然复现、长期累积
       const isPlatformMissing = msg.includes("were found in the response");
