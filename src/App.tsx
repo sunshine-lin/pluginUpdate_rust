@@ -156,7 +156,20 @@ function App() {
         return;
       }
       setSelfUpdate({ kind: "downloading", version: update.version });
-      await update.downloadAndInstall();
+      // 拆成 download + install 两步而非 downloadAndInstall()：后者失败时
+      // 无法判断卡在下载还是安装，而这两者的成因完全不同（网络 vs 权限/占用）。
+      // 进度也一并落盘——上次故障机「一直显示下载中」，无从判断是没开始、
+      // 下到一半断了、还是下完卡在安装
+      let received = 0;
+      let total = 0;
+      await update.download((ev) => {
+        if (ev.event === "Started") total = ev.data.contentLength ?? 0;
+        else if (ev.event === "Progress") received += ev.data.chunkLength;
+      });
+      invoke("log_self_update_info", {
+        message: `下载完成 ${received}/${total} 字节，开始安装 ${update.version}`,
+      }).catch(() => {});
+      await update.install();
       // body 来自 latest.json 的 notes 字段，用于告知这次更新改了什么；
       // 缺失时不显示说明，但不影响升级本身
       setSelfUpdate({
@@ -170,7 +183,10 @@ function App() {
       // 「正在后台下载…」——既不报错也不消失，比直接说失败更让人困惑。
       // 断网、站点 502、磁盘满都会走到这里，不只是平台不匹配
       setSelfUpdate({ kind: "idle" });
-      if (trigger === "manual") setSelfUpdateHint("更新失败，请稍后再试");
+      // 手动触发时把真实错误显示出来。此前只提示「请稍后再试」、原因仅进日志，
+      // 排查者必须去翻日志文件才知道发生了什么——而自更新失败恰恰是最需要
+      // 现场信息的场景。自动轮询仍保持安静，不打扰正在干活的采购同事
+      if (trigger === "manual") setSelfUpdateHint(`更新失败：${msg}`);
       // 当前平台不在清单里属正常情况（只发布 Windows 包），不是故障：
       // 记成 ERROR 会污染「仅异常」视图，且每轮必然复现、长期累积
       const isPlatformMissing = msg.includes("were found in the response");

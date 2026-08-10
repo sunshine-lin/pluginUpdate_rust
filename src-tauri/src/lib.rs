@@ -458,6 +458,14 @@ fn log_self_update_error(message: String) {
     log_client_error(&format!("自动更新失败: {}", message));
 }
 
+/// 记录自更新过程中的进展（下载完成、开始安装等）。
+/// INFO 级不进异常文件——这些是排查线索而非故障：故障机上「一直显示下载中」时，
+/// 靠这条才能区分是没开始下载、下到一半中断、还是下完卡在安装
+#[tauri::command]
+fn log_self_update_info(message: String) {
+    log_client_info(&format!("自动更新: {}", message));
+}
+
 /// 获取开机自启偏好，供前端/托盘菜单回显开关状态
 #[tauri::command]
 fn get_autostart() -> bool {
@@ -733,6 +741,7 @@ pub fn run() {
             open_log_dir,
             get_log_server_port,
             log_self_update_error,
+            log_self_update_info,
             list_log_dates,
             read_log_entries,
         ])
