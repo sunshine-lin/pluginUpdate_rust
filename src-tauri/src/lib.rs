@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
 pub mod log_file;
@@ -677,6 +677,120 @@ async fn perform_update(env: String) -> Result<String, String> {
     Ok(format!("更新完成！当前版本: {}", new_version))
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 机器状态监测（DEV-124169）：采购同事在虚拟机上使用，怀疑资源紧张
+// 导致插件卡顿或更新不稳定，靠这组信息辅助判断——本版只在客户端
+// 本地展示，不做远程上报（现有日志体系本身也全是本地落盘）
+// ─────────────────────────────────────────────────────────────────
+
+/// 单块磁盘的简化信息（脱离 sysinfo::Disks 的具体类型，便于构造测试数据）
+struct DiskInfo {
+    mount_point: String,
+    total_bytes: u64,
+    available_bytes: u64,
+}
+
+/// 一次性采集到的原始硬件数据（脱离 sysinfo::System 的具体类型，便于构造测试数据）
+struct HardwareSample {
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    cpu_brand: String,
+    cpu_cores: usize,
+    cpu_usage_percent: f32,
+    os_version: String,
+}
+
+/// 前端展示用的机器状态快照
+#[derive(Debug, Serialize, Deserialize)]
+struct SystemSnapshot {
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    cpu_brand: String,
+    cpu_cores: usize,
+    cpu_usage_percent: f32,
+    disk_total_bytes: u64,
+    disk_available_bytes: u64,
+    os_version: String,
+}
+
+/// 在磁盘列表中选出安装路径所在的那一块。
+/// 按挂载点字符串做最长前缀匹配（Windows 盘符如 "D:\\" 同样适用，
+/// 一个前缀刚好对应一块盘，不会有更长的候选）；找不到匹配项时
+/// 回退到列表第一项，保守给出一个可用磁盘而非空数据
+fn pick_disk_for_path<'a>(disks: &'a [DiskInfo], install_path: &Path) -> Option<&'a DiskInfo> {
+    let path_str = install_path.to_string_lossy();
+    disks
+        .iter()
+        .filter(|d| path_str.starts_with(d.mount_point.as_str()))
+        .max_by_key(|d| d.mount_point.len())
+        .or_else(|| disks.first())
+}
+
+/// 把采集到的原始数据 + 磁盘列表 + 安装路径，组装成前端展示用的快照（可测试的纯函数）
+fn build_system_snapshot(
+    hw: HardwareSample,
+    disks: &[DiskInfo],
+    install_path: &Path,
+) -> SystemSnapshot {
+    let disk = pick_disk_for_path(disks, install_path);
+    SystemSnapshot {
+        total_memory_bytes: hw.total_memory_bytes,
+        available_memory_bytes: hw.available_memory_bytes,
+        cpu_brand: hw.cpu_brand,
+        cpu_cores: hw.cpu_cores,
+        cpu_usage_percent: hw.cpu_usage_percent,
+        disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
+        disk_available_bytes: disk.map(|d| d.available_bytes).unwrap_or(0),
+        os_version: hw.os_version,
+    }
+}
+
+/// 采集当前机器的 CPU/内存/磁盘/系统版本信息，供前端「机器状态」页展示。
+/// CPU 占用率需要两次采样取差值才准确（sysinfo 官方建议），故刷新两次、
+/// 间隔略大于 sysinfo 内部最小采样间隔
+#[tauri::command]
+async fn get_system_snapshot(env: String) -> SystemSnapshot {
+    use sysinfo::{Disks, System};
+
+    let mut sys = System::new_all();
+    sys.refresh_cpu_usage();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    sys.refresh_cpu_usage();
+
+    let cpu_usage_percent = if sys.cpus().is_empty() {
+        0.0
+    } else {
+        sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
+    };
+    let cpu_brand = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().to_string())
+        .unwrap_or_else(|| "未知".to_string());
+
+    let hw = HardwareSample {
+        total_memory_bytes: sys.total_memory(),
+        available_memory_bytes: sys.available_memory(),
+        cpu_brand,
+        cpu_cores: sys.cpus().len(),
+        cpu_usage_percent,
+        os_version: System::long_os_version().unwrap_or_else(|| "未知".to_string()),
+    };
+
+    let disks = Disks::new_with_refreshed_list();
+    let disk_infos: Vec<DiskInfo> = disks
+        .iter()
+        .map(|d| DiskInfo {
+            mount_point: d.mount_point().to_string_lossy().to_string(),
+            total_bytes: d.total_space(),
+            available_bytes: d.available_space(),
+        })
+        .collect();
+
+    let install_path = get_install_path(&env);
+    build_system_snapshot(hw, &disk_infos, &install_path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -744,6 +858,7 @@ pub fn run() {
             log_self_update_info,
             list_log_dates,
             read_log_entries,
+            get_system_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1309,5 +1424,116 @@ mod tests {
             "不应出现 ERROR 级别：{}",
             line
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 机器状态监测（DEV-124169）：采购同事怀疑虚拟机资源紧张导致
+    // 插件卡顿，靠这组信息辅助判断。只测纯函数部分（字段映射、
+    // 磁盘选择），真实采集依赖运行时系统状态，不易也不必单测
+    // ─────────────────────────────────────────────────────────
+
+    fn make_disk(mount_point: &str, total: u64, available: u64) -> DiskInfo {
+        DiskInfo {
+            mount_point: mount_point.to_string(),
+            total_bytes: total,
+            available_bytes: available,
+        }
+    }
+
+    #[test]
+    fn test_pick_disk_for_path_matches_longest_mount_prefix() {
+        let disks = vec![
+            make_disk("/", 100, 10),
+            make_disk("/Users", 200, 20),
+            make_disk("/Users/foo/data", 300, 30),
+        ];
+        // 安装路径落在最深的挂载点下，应选中最长前缀匹配的那个，
+        // 而非第一个字面匹配到的 "/"
+        let picked = pick_disk_for_path(&disks, Path::new("/Users/foo/data/aichat"));
+        assert_eq!(
+            picked.map(|d| d.mount_point.as_str()),
+            Some("/Users/foo/data"),
+            "应选中挂载点最长前缀匹配的磁盘，而非粗粒度的根盘"
+        );
+    }
+
+    #[test]
+    fn test_pick_disk_for_path_windows_drive_letter() {
+        let disks = vec![make_disk("C:\\", 500, 50), make_disk("D:\\", 800, 80)];
+        let picked = pick_disk_for_path(&disks, Path::new("D:\\aichat"));
+        assert_eq!(
+            picked.map(|d| d.mount_point.as_str()),
+            Some("D:\\"),
+            "虚拟机常见场景：安装在 D 盘时应选中 D 盘而非默认的 C 盘"
+        );
+    }
+
+    #[test]
+    fn test_pick_disk_for_path_falls_back_to_first_when_no_match() {
+        let disks = vec![make_disk("/opt", 100, 10)];
+        // 安装路径与任何已知挂载点都不匹配时，仍应返回一个可用磁盘作为
+        // 保守估计，而不是让前端拿到空数据——总比完全没有磁盘信息有用
+        let picked = pick_disk_for_path(&disks, Path::new("/completely/unrelated/path"));
+        assert_eq!(
+            picked.map(|d| d.mount_point.as_str()),
+            Some("/opt"),
+            "无匹配时应回退到列表中的第一个磁盘，而非返回 None"
+        );
+    }
+
+    #[test]
+    fn test_pick_disk_for_path_empty_list_returns_none() {
+        let disks: Vec<DiskInfo> = vec![];
+        assert!(
+            pick_disk_for_path(&disks, Path::new("/any")).is_none(),
+            "磁盘列表为空时应返回 None，而非 panic"
+        );
+    }
+
+    #[test]
+    fn test_build_system_snapshot_maps_fields_correctly() {
+        let disks = vec![make_disk("/", 1_000_000_000, 400_000_000)];
+        let snapshot = build_system_snapshot(
+            HardwareSample {
+                total_memory_bytes: 8_000_000_000,
+                available_memory_bytes: 3_000_000_000,
+                cpu_brand: "Apple M1".to_string(),
+                cpu_cores: 8,
+                cpu_usage_percent: 42.5,
+                os_version: "macOS 14.5".to_string(),
+            },
+            &disks,
+            Path::new("/aichat"),
+        );
+        assert_eq!(snapshot.total_memory_bytes, 8_000_000_000);
+        assert_eq!(snapshot.available_memory_bytes, 3_000_000_000);
+        assert_eq!(snapshot.cpu_brand, "Apple M1");
+        assert_eq!(snapshot.cpu_cores, 8);
+        assert_eq!(snapshot.cpu_usage_percent, 42.5);
+        assert_eq!(snapshot.os_version, "macOS 14.5");
+        assert_eq!(snapshot.disk_total_bytes, 1_000_000_000);
+        assert_eq!(snapshot.disk_available_bytes, 400_000_000);
+    }
+
+    #[test]
+    fn test_build_system_snapshot_disk_fields_zero_when_no_disk_found() {
+        let disks: Vec<DiskInfo> = vec![];
+        let snapshot = build_system_snapshot(
+            HardwareSample {
+                total_memory_bytes: 1,
+                available_memory_bytes: 1,
+                cpu_brand: "test".to_string(),
+                cpu_cores: 1,
+                cpu_usage_percent: 0.0,
+                os_version: "test".to_string(),
+            },
+            &disks,
+            Path::new("/aichat"),
+        );
+        assert_eq!(
+            snapshot.disk_total_bytes, 0,
+            "找不到磁盘时应给出 0 而非 panic，前端按 0 展示「未知」"
+        );
+        assert_eq!(snapshot.disk_available_bytes, 0);
     }
 }

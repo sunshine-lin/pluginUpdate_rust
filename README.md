@@ -15,6 +15,7 @@
 - **路径缓存**：线上/测试环境独立缓存，优先使用上次保存的自定义路径，无则回退默认路径
 - **更新后自动刷新 Chrome**：更新完成后自动刷新所有 Chrome 窗口的全部标签页（macOS AppleScript / Windows PowerShell）
 - **RPA 打开侧边栏**：配置 Chrome 扩展 ID 后，更新完成自动通过 RPA 打开 aichat 扩展侧边栏，也支持手动点击打开
+- **机器状态查看**：独立 Tab 展示当前电脑的内存、CPU（型号/核数/实时占用率）、安装目录所在磁盘的可用空间、系统版本，每 3 秒自动刷新，辅助判断是否因机器资源紧张导致卡顿
 
 ## 安装路径说明
 
@@ -51,7 +52,7 @@
 ## 开发环境要求
 
 - Node.js >= 20.19 或 >= 22.12（Vite 7 要求，推荐使用 `n` 或 `nvm` 管理版本）
-- Rust >= 1.70
+- Rust >= 1.95（sysinfo 0.39 要求；低于此版本 `cargo build` 会直接报错拒绝编译）
 - npm >= 8
 
 > macOS 本机若有多版本 Node，构建前可临时切换：`export PATH="/usr/local/n/versions/node/22.22.1/bin:$PATH"`

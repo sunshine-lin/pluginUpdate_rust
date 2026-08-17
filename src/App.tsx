@@ -36,7 +36,27 @@ interface LogEntriesResult {
   plugin_names: string[];
 }
 
-type View = "update" | "logs";
+interface SystemSnapshot {
+  total_memory_bytes: number;
+  available_memory_bytes: number;
+  cpu_brand: string;
+  cpu_cores: number;
+  cpu_usage_percent: number;
+  disk_total_bytes: number;
+  disk_available_bytes: number;
+  os_version: string;
+}
+
+type View = "update" | "logs" | "machine";
+
+/// 机器状态页的刷新间隔：3 秒。CPU 占用率类数据需要能看出实时变化，
+/// 但采购同事的机器同时还在跑插件，间隔太短会增加不必要的采样开销
+const MACHINE_STATUS_REFRESH_MS = 3000;
+
+/** 字节数格式化为 GB，保留 1 位小数，供机器状态页展示 */
+function formatBytesAsGb(bytes: number): string {
+  return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+}
 
 const ALL_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"];
 
@@ -80,6 +100,9 @@ function App() {
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logLoading, setLogLoading] = useState<boolean>(false);
   const [logError, setLogError] = useState<string>("");
+
+  // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
+  const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
 
   // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
   const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
@@ -239,6 +262,20 @@ function App() {
       .catch((e) => setLogError(`读取日志失败: ${e}`))
       .finally(() => setLogLoading(false));
   }, [view, selectedDate]);
+
+  // 机器状态页：仅停留在该页时定时刷新，离开立即停止，
+  // 避免不需要时也常驻后台采样
+  useEffect(() => {
+    if (view !== "machine") return;
+    const refresh = () => {
+      invoke<SystemSnapshot>("get_system_snapshot", { env: activeEnv })
+        .then(setSystemSnapshot)
+        .catch(() => {});
+    };
+    refresh();
+    const timer = setInterval(refresh, MACHINE_STATUS_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [view, activeEnv]);
 
   function toggleLevel(level: string) {
     setSelectedLevels((prev) => {
@@ -402,6 +439,12 @@ function App() {
           onClick={() => setView("logs")}
         >
           日志查看
+        </button>
+        <button
+          className={`view-tab-btn ${view === "machine" ? "view-tab-active" : ""}`}
+          onClick={() => setView("machine")}
+        >
+          机器状态
         </button>
         {/* 当前版本常驻显示：排查多台机器时不必再去翻日志 */}
         {appVersion && (
@@ -572,6 +615,42 @@ function App() {
               </table>
             )}
           </div>
+        </div>
+      ) : view === "machine" ? (
+        <div className="machine-status-view">
+          {systemSnapshot ? (
+            <div className="machine-status-grid">
+              <div className="machine-status-card">
+                <span className="machine-status-label">内存</span>
+                <span className="machine-status-value">
+                  {formatBytesAsGb(systemSnapshot.available_memory_bytes)} 可用 / 共{" "}
+                  {formatBytesAsGb(systemSnapshot.total_memory_bytes)}
+                </span>
+              </div>
+              <div className="machine-status-card">
+                <span className="machine-status-label">CPU</span>
+                <span className="machine-status-value">
+                  {systemSnapshot.cpu_brand}（{systemSnapshot.cpu_cores} 核）
+                </span>
+                <span className="machine-status-value machine-status-emphasis">
+                  当前占用 {systemSnapshot.cpu_usage_percent.toFixed(1)}%
+                </span>
+              </div>
+              <div className="machine-status-card">
+                <span className="machine-status-label">磁盘可用空间（安装目录所在盘）</span>
+                <span className="machine-status-value">
+                  {formatBytesAsGb(systemSnapshot.disk_available_bytes)} 可用 / 共{" "}
+                  {formatBytesAsGb(systemSnapshot.disk_total_bytes)}
+                </span>
+              </div>
+              <div className="machine-status-card">
+                <span className="machine-status-label">系统版本</span>
+                <span className="machine-status-value">{systemSnapshot.os_version}</span>
+              </div>
+            </div>
+          ) : (
+            <p className="machine-status-loading">正在获取机器状态…</p>
+          )}
         </div>
       ) : (
         <>

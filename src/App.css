@@ -323,6 +323,48 @@
   min-width: 0;
 }
 
+/* 机器状态页 */
+.machine-status-view {
+  padding: 8px 0;
+}
+
+.machine-status-loading {
+  color: #888;
+  font-size: 13px;
+  text-align: center;
+  padding: 24px 0;
+}
+
+.machine-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.machine-status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #f7f7fb;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.machine-status-label {
+  font-size: 12px;
+  color: #888;
+}
+
+.machine-status-value {
+  font-size: 14px;
+  color: #333;
+}
+
+.machine-status-emphasis {
+  font-weight: 600;
+  color: #667eea;
+}
+
 /* 路径编辑区域 */
 .path-edit-group {
   display: flex;
@@ -854,6 +896,26 @@
   }
 
   .self-update-hint {
+    color: #999;
+  }
+
+  .machine-status-card {
+    background: #2a2a3e;
+  }
+
+  .machine-status-label {
+    color: #999;
+  }
+
+  .machine-status-value {
+    color: #ddd;
+  }
+
+  .machine-status-emphasis {
+    color: #90a4ea;
+  }
+
+  .machine-status-loading {
     color: #999;
   }
 }

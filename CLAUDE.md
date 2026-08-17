@@ -71,6 +71,8 @@ npm run build:test            # 测试环境包
 
 > Node 需 >= 20.19 或 >= 22.12。本机多版本时：
 > `export PATH="/usr/local/n/versions/node/22.22.1/bin:$PATH"`
+>
+> Rust 需 >= 1.95（sysinfo 0.39 要求，`rustup update stable` 升级）。
 
 ## 安全红线（改相关代码前必读）
 
