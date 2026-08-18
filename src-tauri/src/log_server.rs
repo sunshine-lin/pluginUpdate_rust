@@ -95,9 +95,12 @@ async fn ingest_log(
 ) -> (StatusCode, Json<LogAck>) {
     let count = entries.len();
     for e in entries {
+        // 插件用 toISOString() 上报的是 UTC，须归一为北京时间再落盘，
+        // 否则日志页显示的时刻比实际早 8 小时
         let ts = e
             .timestamp
-            .unwrap_or_else(|| crate::current_timestamp());
+            .map(|t| crate::normalize_timestamp(&t))
+            .unwrap_or_else(crate::current_timestamp);
         let level = e.level.unwrap_or_else(|| "info".to_string());
         let source = e.source.unwrap_or_else(|| "unknown".to_string());
         let plugin_name = e.plugin_name.unwrap_or_else(|| "unknown".to_string());
@@ -309,6 +312,42 @@ mod tests {
         assert!(
             lines[0].0.contains("robot-01"),
             "写入内容应含插件名，否则多台机器日志混在一起无法区分来源"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_log_converts_plugin_utc_timestamp_to_beijing() {
+        // 插件侧 new Date().toISOString() 报的是 UTC，落盘前须转北京时间；
+        // 不转的话日志页显示的时刻比实际早 8 小时，排查时按错的时间找现场
+        let sink = Arc::new(MemSink {
+            lines: Mutex::new(Vec::new()),
+        });
+        let entries = vec![LogEntry {
+            timestamp: Some("2026-08-18T01:25:18.602Z".into()),
+            level: Some("info".into()),
+            source: Some("content".into()),
+            plugin_name: Some("aichat".into()),
+            message: "来自 1688 页面".into(),
+        }];
+        ingest_log(
+            State(AppState {
+                sink: sink.clone() as Arc<dyn LogSink>,
+                version: "0.0.0-test".into(),
+            }),
+            Json(entries),
+        )
+        .await;
+
+        let lines = sink.lines.lock().expect("锁获取失败");
+        assert!(
+            lines[0].0.contains("2026-08-18 09:25:18.602"),
+            "UTC 01:25 应落盘为北京时间 09:25，实际写入：{}",
+            lines[0].0
+        );
+        assert!(
+            !lines[0].0.contains('Z') && !lines[0].0.contains("01:25"),
+            "不应残留 ISO 记法或原始 UTC 时刻：{}",
+            lines[0].0
         );
     }
 

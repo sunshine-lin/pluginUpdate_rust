@@ -202,6 +202,30 @@ pub fn current_timestamp() -> String {
         .to_string()
 }
 
+/// 把插件上报的时间戳归一为本地时间（北京时间），格式 `YYYY-MM-DD HH:MM:SS.mmm`。
+///
+/// 插件侧用 `new Date().toISOString()` 上报，得到的是 **UTC** 串
+/// （如 `2026-08-18T01:25:18.602Z`）。若原样落盘，日志页显示的时刻比实际
+/// 早 8 小时，排查者会按错误的时间去找现场；`T`/`Z` 这类 ISO 记法对
+/// 采购同事也不可读。
+///
+/// 归一在**服务端入库时**做而非前端展示时做：日志文件本身就该是可直接阅读的
+/// 北京时间，前端只是消费方之一（还有人直接翻日志目录里的文件）。
+///
+/// 认不出格式时原样返回——日志内容比格式统一更重要，不能因解析失败丢掉时间信息。
+pub fn normalize_timestamp(raw: &str) -> String {
+    // 带时区的 ISO8601（Z 或 ±HH:MM）：转成本地时区
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+    }
+    // 已是本地格式（服务端自己生成的）或无法识别：原样返回，
+    // 不做二次偏移——否则每经一次处理就多加 8 小时
+    raw.to_string()
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Chrome 标签页刷新相关纯函数（可测试）
 // ─────────────────────────────────────────────────────────────────
@@ -1194,6 +1218,49 @@ mod tests {
             true,
             "自启偏好未正确写入"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 时间戳归一化：插件侧用 new Date().toISOString() 上报 UTC
+    // （形如 2026-08-18T01:25:18.602Z），直接落盘会让日志页显示成
+    // 比北京时间早 8 小时、且格式对非技术同事不可读
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_timestamp_converts_utc_iso_to_beijing() {
+        // 插件用 toISOString() 上报的 UTC 串，须转成北京时间（+8）
+        let got = normalize_timestamp("2026-08-18T01:25:18.602Z");
+        assert_eq!(
+            got, "2026-08-18 09:25:18.602",
+            "UTC 01:25 应显示为北京时间 09:25；不转换会让排查者按错误时刻找现场"
+        );
+    }
+
+    #[test]
+    fn test_normalize_timestamp_converts_offset_iso_to_beijing() {
+        // 带任意时区偏移的 ISO 串同样要归一到北京时间
+        let got = normalize_timestamp("2026-08-18T01:25:18.602+00:00");
+        assert_eq!(got, "2026-08-18 09:25:18.602");
+    }
+
+    #[test]
+    fn test_normalize_timestamp_keeps_already_local_format() {
+        // 服务端自己生成的本地格式（current_timestamp）原样保留，
+        // 不能因为再次归一化而被平移 8 小时
+        let local = "2026-08-18 09:25:18.602";
+        assert_eq!(
+            normalize_timestamp(local),
+            local,
+            "已是本地格式的时间戳不得再次偏移，否则每经一次处理就多加 8 小时"
+        );
+    }
+
+    #[test]
+    fn test_normalize_timestamp_falls_back_to_original_when_unparseable() {
+        // 认不出的格式保留原值：日志内容比格式统一更重要，
+        // 不能因为解析失败就丢掉这条日志的时间信息
+        let weird = "不是时间";
+        assert_eq!(normalize_timestamp(weird), weird);
     }
 
     // ─────────────────────────────────────────────────────────
