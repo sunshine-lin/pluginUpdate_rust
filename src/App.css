@@ -73,30 +73,26 @@
   position: relative;
 }
 
-/* 版本号靠右绝对定位：不占据流内空间，标签仍保持整体居中。
-   加了机器负载指示器后内容变长，允许换行避免在窄窗口下截断 */
+/* 版本号靠右绝对定位：不占据流内空间，标签仍保持整体居中 */
 .app-version {
   position: absolute;
   right: 0;
   bottom: 8px;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  justify-content: flex-end;
   gap: 8px;
-  max-width: 260px;
   font-size: 12px;
   color: #999;
   user-select: text;
 }
 
-/* 机器负载简化指示器：紧跟 tab 栏下方独立一行、靠右对齐，
-   不与绝对定位的 .app-version 同行，避免在窄窗口下和居中的 tab 文字重叠。
+/* 机器负载简化指示器：绝对定位，以 .app-version（right:0; bottom:8px）为基准
+   上移 50px、右移 50px。文案已精简（省去 CPU/内存字样，靠 title 补全语义）。
    正常绿色，CPU>80%或内存可用<10%时变红提醒 */
 .machine-status-indicator {
-  display: block;
-  text-align: right;
-  margin: -12px 0 12px;
+  position: absolute;
+  right: 0;
+  bottom: 58px;
   font-size: 11px;
   color: #2e7d32;
   white-space: nowrap;

@@ -469,9 +469,8 @@ function App() {
             v{appVersion}
           </span>
         )}
-        {/* 机器负载简化指示器：另起一行置于 tab 栏下方，常驻显示，无需切到
-            「机器状态」页才能看到，负载过高时变红提醒——单独一行是因为与
-            上面 app-version 同行会跟居中的 tab 文字重叠（窗口仅 600px 宽） */}
+        {/* 机器负载简化指示器：绝对定位常驻显示，无需切到「机器状态」页才能看到，
+            负载过高时变红提醒。位置相对 tab 栏右下角上移/右移（见 CSS 的 right/bottom） */}
         {systemSnapshot && (
           <span
             className={`machine-status-indicator ${
@@ -481,8 +480,8 @@ function App() {
               1
             )}%，内存可用 ${formatBytesAsGb(systemSnapshot.available_memory_bytes)}`}
           >
-            CPU {systemSnapshot.cpu_usage_percent.toFixed(0)}% ·{" "}
-            {formatBytesAsGb(systemSnapshot.available_memory_bytes)}
+            CPU {systemSnapshot.cpu_usage_percent.toFixed(0)}% · 内存{" "}
+            {(systemSnapshot.available_memory_bytes / 1024 / 1024 / 1024).toFixed(1)}G 可用
           </span>
         )}
       </div>
