@@ -49,6 +49,8 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tokio",
+ "tower",
+ "tower-http",
  "zip 2.4.2",
 ]
 

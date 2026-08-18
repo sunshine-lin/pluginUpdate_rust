@@ -81,6 +81,7 @@ npm run build:test            # 测试环境包
 | 扩展 ID 必须过 `validate_extension_id()`（32 位 a-p） | `lib.rs:121` | 直接拼进 AppleScript/PowerShell，不校验即命令注入 |
 | ZIP 解压跳过含 `..` 的条目 | `perform_update()` | 防路径穿越写出安装目录 |
 | 仅测试环境禁用 SSL 校验 + 绕过代理 | `build_http_client()` | 线上环境不得关闭校验 |
+| 日志服务 CORS 放开任意来源的前提：**只写不读** | `log_server.rs` `build_cors_layer()` | 现仅有写日志/健康检查接口，故放开无泄露风险；**新增任何读取日志的接口时必须同步收紧为来源白名单**，否则任意网页可读走含 token/聊天/报价的日志 |
 
 ## 不要做的事
 

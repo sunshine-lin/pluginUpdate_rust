@@ -26,8 +26,14 @@ dirs = "6"
 tauri-plugin-single-instance = "2.4.3"
 tauri-plugin-autostart = "2.5.1"
 axum = "0.8.9"
+tower-http = { version = "0.6", features = ["cors"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 sysinfo = "0.39"
+
+[dev-dependencies]
+# 测试里用 ServiceExt::oneshot 直接驱动 axum Router 验证 CORS 响应头，
+# 无需真起 HTTP 服务
+tower = { version = "0.5", features = ["util"] }
 

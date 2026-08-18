@@ -111,10 +111,35 @@ fn build_router(sink: Arc<dyn LogSink>, version: &str) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/log", post(ingest_log))
+        .layer(build_cors_layer())
         .with_state(AppState {
             sink,
             version: version.to_string(),
         })
+}
+
+/// 构建 CORS 层。
+///
+/// 插件注入在 1688、CJ PMS 等第三方页面里运行，向 `127.0.0.1` 投递日志属
+/// **跨域请求**：浏览器会先发 OPTIONS 预检，缺 CORS 头时直接拦截，日志一条
+/// 都到不了本地（实测现象即插件侧报跨域错误）。
+///
+/// # 为何允许任意来源
+/// 采购同事的插件未来可能跑在更多站点上，白名单方式每加一个站点就要改代码
+/// 重新发版；本服务的暴露面也有限：
+/// - 仅绑定 127.0.0.1，局域网内其它机器访问不到（见本文件顶部安全边界说明）
+/// - 只提供「写入日志」与「查健康状态」，**不提供任何读取日志内容的接口**，
+///   故放开来源不会导致已落盘的 token / 聊天记录 / 报价被第三方网页读走
+///
+/// 残留风险是任意网页可探测本机是否装了本更新器、并投递伪造日志行——
+/// 相较于日志收不到导致排查无从下手，这个代价可以接受（2026-08-18 拍板）。
+/// 若日后新增「读取日志」类接口，**必须重新收紧为来源白名单**。
+fn build_cors_layer() -> tower_http::cors::CorsLayer {
+    use tower_http::cors::{Any, CorsLayer};
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 /// 在后台线程启动日志服务，返回实际绑定的端口。
@@ -345,6 +370,90 @@ mod tests {
             resp.version,
             env!("CARGO_PKG_VERSION"),
             "本测试注入了与 Cargo 版本不同的值，若相等说明实现仍在读 CARGO_PKG_VERSION"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // CORS：插件运行在 1688 等第三方页面里，向 127.0.0.1 投递日志属跨域请求。
+    // 缺少 CORS 头时浏览器直接拦截，日志一条都收不到（实测现象）
+    // ─────────────────────────────────────────────────────────
+
+    fn test_router() -> Router {
+        let sink = Arc::new(MemSink {
+            lines: Mutex::new(Vec::new()),
+        });
+        build_router(sink as Arc<dyn LogSink>, "0.0.0-test")
+    }
+
+    #[tokio::test]
+    async fn test_preflight_options_on_log_is_allowed() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        // 浏览器在跨域 POST 前先发 OPTIONS 预检；没有 CORS 层时该方法未注册，
+        // 会返回 405 导致真正的 POST 根本不会发出
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/log")
+            .header("origin", "https://www.1688.com")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .expect("构造预检请求失败");
+
+        let resp = test_router().oneshot(req).await.expect("预检请求执行失败");
+
+        assert!(
+            resp.status().is_success(),
+            "OPTIONS 预检必须成功，收到 {}；失败时浏览器不会发出后续 POST",
+            resp.status()
+        );
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "预检响应需带 Allow-Origin: *，否则浏览器判定跨域被拒"
+        );
+        assert!(
+            headers
+                .get("access-control-allow-headers")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("content-type") || v == "*")
+                .unwrap_or(false),
+            "需允许 content-type 请求头，插件以 application/json 提交日志"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_log_response_carries_cors_origin_header() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        // 预检通过后的实际 POST，其响应同样需要带 Allow-Origin，
+        // 否则浏览器仍会拦下响应、插件侧看到的还是跨域错误
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/log")
+            .header("origin", "https://www.1688.com")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"[{"level":"info","source":"content","pluginName":"aichat","message":"跨域测试"}]"#,
+            ))
+            .expect("构造日志请求失败");
+
+        let resp = test_router().oneshot(req).await.expect("日志请求执行失败");
+
+        assert!(resp.status().is_success(), "日志写入应返回 2xx");
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "实际 POST 的响应也必须带 Allow-Origin，只在预检上带不够"
         );
     }
 }
