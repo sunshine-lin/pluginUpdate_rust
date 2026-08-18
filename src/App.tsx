@@ -58,6 +58,16 @@ function formatBytesAsGb(bytes: number): string {
   return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
 }
 
+/// 判定机器是否处于高负载：CPU 占用 > 80% 或可用内存占比 < 10%。
+/// 满足任一条件即预警——两者都是"快卡顿"的经验阈值，不要求同时满足
+function isHighLoad(snapshot: SystemSnapshot): boolean {
+  const memoryAvailableRatio =
+    snapshot.total_memory_bytes === 0
+      ? 1
+      : snapshot.available_memory_bytes / snapshot.total_memory_bytes;
+  return snapshot.cpu_usage_percent > 80 || memoryAvailableRatio < 0.1;
+}
+
 const ALL_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG"];
 
 /// 自更新检查间隔：4 小时。采购机器常整天开着，间隔太短徒增站点请求，
@@ -263,10 +273,9 @@ function App() {
       .finally(() => setLogLoading(false));
   }, [view, selectedDate]);
 
-  // 机器状态页：仅停留在该页时定时刷新，离开立即停止，
-  // 避免不需要时也常驻后台采样
+  // 机器状态：常驻定时刷新（不只在「机器状态」页才采样），
+  // 供标题栏简化指示器随时显示，无需切到该页才能看到负载情况
   useEffect(() => {
-    if (view !== "machine") return;
     const refresh = () => {
       invoke<SystemSnapshot>("get_system_snapshot", { env: activeEnv })
         .then(setSystemSnapshot)
@@ -275,7 +284,7 @@ function App() {
     refresh();
     const timer = setInterval(refresh, MACHINE_STATUS_REFRESH_MS);
     return () => clearInterval(timer);
-  }, [view, activeEnv]);
+  }, [activeEnv]);
 
   function toggleLevel(level: string) {
     setSelectedLevels((prev) => {
@@ -458,6 +467,22 @@ function App() {
               {checkingUpdate ? "检查中…" : "检查更新"}
             </button>
             v{appVersion}
+          </span>
+        )}
+        {/* 机器负载简化指示器：另起一行置于 tab 栏下方，常驻显示，无需切到
+            「机器状态」页才能看到，负载过高时变红提醒——单独一行是因为与
+            上面 app-version 同行会跟居中的 tab 文字重叠（窗口仅 600px 宽） */}
+        {systemSnapshot && (
+          <span
+            className={`machine-status-indicator ${
+              isHighLoad(systemSnapshot) ? "machine-status-indicator-high" : ""
+            }`}
+            title={`CPU 占用 ${systemSnapshot.cpu_usage_percent.toFixed(
+              1
+            )}%，内存可用 ${formatBytesAsGb(systemSnapshot.available_memory_bytes)}`}
+          >
+            CPU {systemSnapshot.cpu_usage_percent.toFixed(0)}% ·{" "}
+            {formatBytesAsGb(systemSnapshot.available_memory_bytes)}
           </span>
         )}
       </div>
