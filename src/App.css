@@ -352,6 +352,19 @@
   padding: 24px 0;
 }
 
+/* 机器状态页底部操作区（手动打开侧边栏等） */
+.machine-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.machine-status-hint {
+  font-size: 12px;
+  color: #888;
+}
+
 .machine-status-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -941,6 +954,10 @@
   }
 
   .machine-status-loading {
+    color: #999;
+  }
+
+  .machine-status-hint {
     color: #999;
   }
 }

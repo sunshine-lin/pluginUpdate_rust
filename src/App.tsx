@@ -113,6 +113,8 @@ function App() {
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
+  // 手动打开插件侧边栏的结果提示（自愈流程会自动调，这里供排查时手动触发）
+  const [sidepanelHint, setSidepanelHint] = useState<string>("");
 
   // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
   const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
@@ -424,6 +426,19 @@ function App() {
   }
 
   /** 更新完成后自动刷新所有 Chrome 标签页 */
+  /// 手动触发打开插件侧边栏。
+  /// 自愈流程（DEV-124702）会在重启 Chrome 后自动调用同一个命令；
+  /// 这里保留手动入口，供排查时确认快捷键链路是否通
+  async function handleOpenSidepanel() {
+    setSidepanelHint("正在打开侧边栏…");
+    try {
+      const result = await invoke<string>("open_plugin_sidepanel");
+      setSidepanelHint(result);
+    } catch (e) {
+      setSidepanelHint(`打开侧边栏失败: ${e}`);
+    }
+  }
+
   async function postUpdateChromeActions() {
     try {
       const refreshResult = await invoke<string>("refresh_chrome_tabs");
@@ -675,6 +690,16 @@ function App() {
           ) : (
             <p className="machine-status-loading">正在获取机器状态…</p>
           )}
+          {/* 插件侧边栏必须常驻打开才能处理任务。自愈流程会自动拉起，
+              这里保留手动入口供排查确认链路是否通 */}
+          <div className="machine-status-actions">
+            <button className="btn-secondary" onClick={handleOpenSidepanel}>
+              打开插件侧边栏
+            </button>
+            {sidepanelHint && (
+              <span className="machine-status-hint">{sidepanelHint}</span>
+            )}
+          </div>
         </div>
       ) : (
         <>

@@ -301,6 +301,95 @@ fn run_refresh_chrome_tabs_os() -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// 自动打开插件侧边栏（DEV-124702）
+//
+// Chrome 规定 sidePanel.open() 必须由**用户手势**触发，外部进程既碰不到
+// 该 API、也无法伪造手势——2026-07-30 的 af1233b 曾试过「拼
+// chrome-extension://<id>/sidepanel.html 让 Chrome 导航」，那只是在标签页
+// 里打开了一个 HTML 文件、并未触发真正的侧边栏，故当时判定「不可靠」而移除。
+//
+// 本方案改为**模拟按下插件已注册的快捷键**（Ctrl+Shift+L，见插件
+// wxt.config.ts 的 commands.toggle_sidepanel，处理逻辑在 background.ts
+// 里调 sidePanel.open()）：键盘事件是合法的用户手势，Chrome 会正常触发
+// 插件的 commands 监听。区别在于「走合法路径触发真 API」而非「绕过 API
+// 模拟效果」。已在 Windows 虚拟机手动验证快捷键可打开侧边栏。
+// ─────────────────────────────────────────────────────────────────
+
+/// 构建 Windows PowerShell 命令：激活 Chrome 后发送 Ctrl+Shift+L 打开侧边栏。
+///
+/// SendKeys 记法：`^` = Ctrl，`+` = Shift，故 `^+l` 即 Ctrl+Shift+L。
+/// 必须先 AppActivate——SendKeys 是发给「当前焦点窗口」的，不激活会把按键
+/// 发给别的程序；激活是异步的，紧接着发按键会丢失，故中间需要等待。
+pub fn build_open_sidepanel_command_windows() -> String {
+    "Add-Type -AssemblyName Microsoft.VisualBasic; \
+     Add-Type -AssemblyName System.Windows.Forms; \
+     $p = Get-Process -Name chrome -ErrorAction SilentlyContinue | \
+       Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; \
+     if ($p) { \
+       [Microsoft.VisualBasic.Interaction]::AppActivate($p.Id); \
+       Start-Sleep -Milliseconds 400; \
+       [System.Windows.Forms.SendKeys]::SendWait('^+l') \
+     }"
+    .to_string()
+}
+
+/// 构建 macOS AppleScript：激活 Chrome 后发送 Command+Shift+L 打开侧边栏。
+///
+/// 仅供本机开发调试——采购同事全部使用 Windows 虚拟机。
+/// macOS 下 System Events 模拟按键需用户授予「辅助功能」权限。
+pub fn build_open_sidepanel_script_macos() -> String {
+    "tell application \"Google Chrome\" to activate\n\
+     delay 0.4\n\
+     tell application \"System Events\"\n\
+       keystroke \"l\" using {command down, shift down}\n\
+     end tell"
+        .to_string()
+}
+
+/// 执行平台相关的「打开插件侧边栏」命令
+#[cfg(target_os = "macos")]
+fn run_open_sidepanel_os() -> Result<String, String> {
+    let script = build_open_sidepanel_script_macos();
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("执行AppleScript打开侧边栏失败: {}", e))?;
+    if output.status.success() {
+        Ok("已发送打开侧边栏快捷键".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Chrome 未运行时非致命：自愈流程可能在 Chrome 启动前就跑到这里
+        if stderr.contains("is not running") || stderr.is_empty() {
+            Ok("Chrome 未运行，跳过打开侧边栏".to_string())
+        } else {
+            Err(format!("AppleScript打开侧边栏失败: {}", stderr))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_open_sidepanel_os() -> Result<String, String> {
+    let cmd = build_open_sidepanel_command_windows();
+    let output = std::process::Command::new("powershell")
+        .args(["-Command", &cmd])
+        .output()
+        .map_err(|e| format!("执行PowerShell打开侧边栏失败: {}", e))?;
+    if output.status.success() {
+        Ok("已发送打开侧边栏快捷键".to_string())
+    } else {
+        Err(format!(
+            "PowerShell打开侧边栏失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_open_sidepanel_os() -> Result<String, String> {
+    Err("当前平台不支持自动打开插件侧边栏".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────
 // 私有辅助函数
 // ─────────────────────────────────────────────────────────────────
 
@@ -567,6 +656,14 @@ fn read_log_entries(date: String, error_only: bool) -> Result<LogEntriesResult, 
 #[tauri::command]
 fn refresh_chrome_tabs() -> Result<String, String> {
     run_refresh_chrome_tabs_os()
+}
+
+/// 打开 AIChat 插件侧边栏（模拟按下插件注册的 Ctrl+Shift+L 快捷键）。
+/// 供自愈流程在重启 Chrome 后把侧边栏拉起来——插件设计上要求 sidepanel
+/// 常驻打开才能处理任务，只重启进程而不开侧边栏等于没恢复
+#[tauri::command]
+fn open_plugin_sidepanel() -> Result<String, String> {
+    run_open_sidepanel_os()
 }
 
 /// 检查更新（对比本地与远程版本）
@@ -883,6 +980,7 @@ pub fn run() {
             list_log_dates,
             read_log_entries,
             get_system_snapshot,
+            open_plugin_sidepanel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1152,6 +1250,89 @@ mod tests {
         assert!(
             cmd.contains("Refresh"),
             "Windows 刷新命令应包含 Refresh 方法调用"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 自动打开插件侧边栏（DEV-124702 阶段一）
+    //
+    // Chrome 要求 sidePanel.open() 必须由用户手势触发，外部进程无法直接
+    // 调用该 API（2026-07-30 的 af1233b 已验证「拼 chrome-extension:// URL
+    // 导航」这条路走不通）。改为模拟按下插件已注册的快捷键 Ctrl+Shift+L
+    // ——键盘事件是合法的用户手势，Chrome 会正常触发插件的 commands 监听
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_windows_open_sidepanel_sends_ctrl_shift_l() {
+        let cmd = build_open_sidepanel_command_windows();
+        assert!(
+            cmd.contains("^+l"),
+            "必须发送 Ctrl+Shift+L（SendKeys 记法 ^=Ctrl +=Shift）——\
+             这是插件注册的 toggle_sidepanel 快捷键，换成别的键不会触发侧边栏：{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("SendKeys"),
+            "需要用 SendKeys 模拟真实键盘事件；直接调 Chrome API 会因缺少用户手势被拒：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_windows_open_sidepanel_activates_chrome_first() {
+        let cmd = build_open_sidepanel_command_windows();
+        assert!(
+            cmd.contains("AppActivate"),
+            "必须先激活 Chrome 窗口——SendKeys 是发给当前焦点窗口的，\
+             不激活会把快捷键发给别的程序：{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("chrome"),
+            "需按进程名定位 Chrome：{}",
+            cmd
+        );
+        // 激活窗口是异步的，紧接着发按键会丢失
+        assert!(
+            cmd.contains("Sleep"),
+            "激活与发送之间需要等待，否则窗口尚未获得焦点、按键丢失：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_windows_open_sidepanel_tolerates_chrome_absent() {
+        let cmd = build_open_sidepanel_command_windows();
+        assert!(
+            cmd.contains("SilentlyContinue") || cmd.contains("if ("),
+            "Chrome 未运行时不应报错——虚拟机上 Chrome 可能还没启动，\
+             此时应静默跳过而非把自愈流程整体拖挂：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_macos_open_sidepanel_sends_cmd_shift_l() {
+        let script = build_open_sidepanel_script_macos();
+        assert!(
+            script.contains("command down") && script.contains("shift down"),
+            "macOS 上快捷键是 Command+Shift+L（插件 suggested_key 的 mac 配置）：{}",
+            script
+        );
+        assert!(
+            script.contains("keystroke \"l\""),
+            "应发送字母 l：{}",
+            script
+        );
+        assert!(
+            script.contains("activate"),
+            "需先激活 Chrome，否则按键发给当前焦点程序：{}",
+            script
+        );
+        assert!(
+            script.contains("System Events"),
+            "macOS 模拟按键须经 System Events：{}",
+            script
         );
     }
 
