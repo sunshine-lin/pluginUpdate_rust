@@ -390,6 +390,85 @@ fn run_open_sidepanel_os() -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// 重启 Chrome（DEV-124702 二级自愈）
+//
+// 插件「全死」（Service Worker 崩溃到唤不醒）时收不到 reload 指令，
+// 只能重启浏览器让插件随之重新加载——这是代价最大的自愈手段，仅在
+// 一级（下发 reload）无效后才升级到此处，且调用方须自行控制冷却期。
+// ─────────────────────────────────────────────────────────────────
+
+/// 构建 Windows PowerShell 命令：温和关闭 Chrome，失败则强杀，随后重新拉起。
+///
+/// 为何先 CloseMainWindow 而非直接 taskkill /F：强杀会被 Chrome 判定为异常
+/// 崩溃，下次启动弹「要恢复页面吗」提示，采购同事的标签页也可能丢失。
+/// 但温和关闭可能因页面弹「确定要离开吗」而卡住，故留强杀兜底。
+/// 关闭与重启之间必须等待——进程未真正退出时启动新实例会复用旧进程，
+/// 插件不会重新加载，自愈等于没做。
+pub fn build_restart_chrome_command_windows() -> String {
+    "$procs = Get-Process -Name chrome -ErrorAction SilentlyContinue; \
+     if ($procs) { \
+       $procs | ForEach-Object { $_.CloseMainWindow() | Out-Null }; \
+       Start-Sleep -Seconds 3; \
+       Get-Process -Name chrome -ErrorAction SilentlyContinue | \
+         ForEach-Object { $_.Kill() }; \
+       Start-Sleep -Seconds 2 \
+     }; \
+     Start-Process 'chrome'"
+        .to_string()
+}
+
+/// 构建 macOS AppleScript：退出并重新打开 Chrome。
+/// 仅供本机开发调试——采购同事全部使用 Windows 虚拟机
+pub fn build_restart_chrome_script_macos() -> String {
+    "tell application \"Google Chrome\" to quit\n\
+     delay 3\n\
+     tell application \"Google Chrome\" to activate"
+        .to_string()
+}
+
+/// 执行平台相关的「重启 Chrome」命令
+#[cfg(target_os = "macos")]
+fn run_restart_chrome_os() -> Result<String, String> {
+    let script = build_restart_chrome_script_macos();
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("执行AppleScript重启Chrome失败: {}", e))?;
+    if output.status.success() {
+        Ok("已重启 Chrome".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("is not running") || stderr.is_empty() {
+            Ok("Chrome 未运行，已尝试启动".to_string())
+        } else {
+            Err(format!("AppleScript重启Chrome失败: {}", stderr))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_restart_chrome_os() -> Result<String, String> {
+    let cmd = build_restart_chrome_command_windows();
+    let output = std::process::Command::new("powershell")
+        .args(["-Command", &cmd])
+        .output()
+        .map_err(|e| format!("执行PowerShell重启Chrome失败: {}", e))?;
+    if output.status.success() {
+        Ok("已重启 Chrome".to_string())
+    } else {
+        Err(format!(
+            "PowerShell重启Chrome失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_restart_chrome_os() -> Result<String, String> {
+    Err("当前平台不支持重启 Chrome".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────
 // 私有辅助函数
 // ─────────────────────────────────────────────────────────────────
 
@@ -664,6 +743,21 @@ fn refresh_chrome_tabs() -> Result<String, String> {
 #[tauri::command]
 fn open_plugin_sidepanel() -> Result<String, String> {
     run_open_sidepanel_os()
+}
+
+/// 重启 Chrome 并把插件侧边栏拉起来（二级自愈的完整动作）。
+///
+/// 两步必须连在一起：只重启浏览器的话，插件虽然重新加载了，但
+/// sidepanel 不会自动打开——而插件设计上要求 sidepanel 常驻才能处理任务，
+/// 等于自愈只做了一半。等待时间给 Chrome 启动与插件初始化留余量
+#[tauri::command]
+fn restart_chrome_and_open_sidepanel() -> Result<String, String> {
+    let restart = run_restart_chrome_os()?;
+    // Chrome 冷启动 + 插件 Service Worker 初始化需要时间，
+    // 过早发快捷键会因插件尚未注册 command 监听而丢失
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let sidepanel = run_open_sidepanel_os()?;
+    Ok(format!("{}；{}", restart, sidepanel))
 }
 
 /// 检查更新（对比本地与远程版本）
@@ -981,6 +1075,7 @@ pub fn run() {
             read_log_entries,
             get_system_snapshot,
             open_plugin_sidepanel,
+            restart_chrome_and_open_sidepanel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1332,6 +1427,74 @@ mod tests {
         assert!(
             script.contains("System Events"),
             "macOS 模拟按键须经 System Events：{}",
+            script
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 重启 Chrome（DEV-124702 二级自愈）
+    //
+    // 插件「全死」（Service Worker 崩溃到唤不醒）时收不到 reload 指令，
+    // 只能重启浏览器让插件随之重新加载。这是代价最大的手段，故：
+    // 1. 优先温和退出而非强杀——强杀会被 Chrome 判定为异常崩溃，
+    //    下次启动弹「恢复页面」提示，且可能丢失会话
+    // 2. 重启后必须把侧边栏拉起来（插件设计上要求 sidepanel 常驻）
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_windows_restart_chrome_quits_gracefully_first() {
+        let cmd = build_restart_chrome_command_windows();
+        assert!(
+            cmd.contains("CloseMainWindow"),
+            "应先尝试温和关闭主窗口——直接 taskkill /F 会被 Chrome 判定为崩溃，\
+             下次启动弹恢复提示，采购同事的标签页也可能丢：{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("chrome"),
+            "需按进程名定位 Chrome：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_windows_restart_chrome_has_force_kill_fallback() {
+        let cmd = build_restart_chrome_command_windows();
+        // 温和关闭可能因页面弹「确定要离开吗」而卡住，必须有兜底
+        assert!(
+            cmd.contains("Kill") || cmd.contains("taskkill"),
+            "温和关闭失败时需强制结束，否则自愈会卡在这一步永远不往下走：{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("Start-Process") || cmd.contains("start "),
+            "关闭后必须重新拉起 Chrome，否则插件永远起不来：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_windows_restart_chrome_waits_between_steps() {
+        let cmd = build_restart_chrome_command_windows();
+        assert!(
+            cmd.contains("Sleep"),
+            "关闭与重启之间需等待进程真正退出，否则新实例会复用旧进程、\
+             插件不会重新加载，自愈等于没做：{}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_macos_restart_chrome_structure() {
+        let script = build_restart_chrome_script_macos();
+        assert!(
+            script.contains("quit"),
+            "macOS 下用 quit 温和退出（AppleScript 无强杀语义）：{}",
+            script
+        );
+        assert!(
+            script.contains("Google Chrome"),
+            "需指明目标应用：{}",
             script
         );
     }
