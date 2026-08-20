@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
+pub mod heartbeat;
 pub mod log_file;
 pub mod log_server;
 pub mod updater_manifest;
@@ -592,6 +593,10 @@ fn save_custom_path(env: String, path: String) -> Result<(), String> {
 /// 日志服务实际绑定的端口。0 表示未启动成功
 static LOG_SERVER_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
+/// 自愈巡检间隔。比一级阈值（20 秒）小得多，保证超时后能及时发现；
+/// 巡检只做内存态判定、无 IO，频繁一点也不费资源
+const HEAL_INSPECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 全局日志写入器：客户端自身的错误（如托盘操作失败）与插件转发日志
 /// 共用同一套落盘文件，而非仅打到 stdout/stderr——打包后 stderr 无人接收，
 /// 之前的 eprintln! 在生产环境等于没记录
@@ -743,6 +748,59 @@ fn refresh_chrome_tabs() -> Result<String, String> {
 #[tauri::command]
 fn open_plugin_sidepanel() -> Result<String, String> {
     run_open_sidepanel_os()
+}
+
+/// 启动自愈巡检后台线程。
+///
+/// 判定放在客户端本地而非中心：网断了、中心挂了，本机自愈照常工作；
+/// 且判定在本地是秒级反应，绕中心要等好几个网络往返。
+///
+/// 本函数只负责「把判定结果落成实际动作」，判定逻辑全在 heartbeat 模块（可单测）
+fn spawn_heal_inspector(registry: std::sync::Arc<std::sync::Mutex<heartbeat::HeartbeatRegistry>>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(HEAL_INSPECT_INTERVAL);
+        let actions = match registry.lock() {
+            Ok(mut reg) => reg.inspect(std::time::Instant::now()),
+            // 锁被毒化时跳过本轮而非让巡检线程整体退出——
+            // 退出等于自愈永久失效，比跳过一轮严重得多
+            Err(_) => continue,
+        };
+        for (plugin, action) in actions {
+            match action {
+                heartbeat::HealAction::None => {}
+                heartbeat::HealAction::IssueReload => {
+                    // 指令已入队，等插件下次心跳自取；这里只记录便于排查
+                    log_client_info(&format!("[自愈] {} 心跳超时，已下发 reload 指令", plugin));
+                }
+                heartbeat::HealAction::OpenSidepanel => {
+                    log_client_info(&format!("[自愈] {} 侧边栏未打开，尝试拉起", plugin));
+                    if let Err(e) = run_open_sidepanel_os() {
+                        log_client_error(&format!("[自愈] {} 打开侧边栏失败: {}", plugin, e));
+                    }
+                }
+                // 二级自愈（重启 Chrome）暂不启用：一台机器会多开 2~3 个 Chrome
+                // 实例、各自登录不同 CJ 账号，重启会把全部实例一起干掉，正在跑的
+                // 采购任务全断——代价远大于收益。判定逻辑与执行命令均已实现并测试
+                // 通过（heartbeat 模块 + run_restart_chrome_os），确认收益大于风险
+                // 后接线即可，此处只记录以便观察真实发生频率
+                heartbeat::HealAction::RestartChrome => {
+                    log_client_error(&format!(
+                        "[自愈] {} 彻底失联（已达重启条件，但重启 Chrome 暂未启用），等待人工介入",
+                        plugin
+                    ));
+                }
+                heartbeat::HealAction::RestartSuppressed(reason) => {
+                    log_client_error(&format!(
+                        "[自愈] {} 彻底失联（{}），等待人工介入",
+                        plugin, reason
+                    ));
+                }
+                // 同一原因已上报过，不重复记录——巡检每 5 秒一轮，
+                // 不去重会让一台故障机一天攒出上千条相同日志
+                heartbeat::HealAction::RestartSuppressedSilently => {}
+            }
+        }
+    });
 }
 
 /// 重启 Chrome 并把插件侧边栏拉起来（二级自愈的完整动作）。
@@ -1038,7 +1096,12 @@ pub fn run() {
             // 启动即记录自身版本：自更新失败是静默的（采购同事看到报错也无从处理），
             // 没有这条日志就无法判断十几台机器里谁卡在旧版没升上来
             log_client_info(&build_startup_version_line(&app_version));
-            match log_server::spawn(sink, &app_version) {
+            // 心跳状态表由 HTTP 服务与自愈巡检共享同一实例：
+            // 巡检要读 HTTP 侧写入的 last_seen，也要往队列塞待下发指令
+            let heartbeats = std::sync::Arc::new(std::sync::Mutex::new(
+                heartbeat::HeartbeatRegistry::new(),
+            ));
+            match log_server::spawn(sink, &app_version, heartbeats.clone()) {
                 Ok(port) => {
                     LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
                     println!(
@@ -1046,6 +1109,9 @@ pub fn run() {
                         port,
                         get_log_dir()
                     );
+                    // 仅在日志服务起来后才启动巡检：服务没起来时插件根本发不了
+                    // 心跳，巡检只会把「从未上报」误判成失联而反复重启 Chrome
+                    spawn_heal_inspector(heartbeats);
                 }
                 Err(e) => log_client_error(&format!("日志服务启动失败（不影响更新功能）: {}", e)),
             }

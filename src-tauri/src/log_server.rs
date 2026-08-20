@@ -13,8 +13,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use crate::heartbeat::{HeartbeatRegistry, HeartbeatRequest, HeartbeatResponse};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// 起始端口。插件侧需与此一致；被占用时向后递增探测
 pub const DEFAULT_PORT: u16 = 17653;
@@ -78,6 +80,9 @@ struct AppState {
     sink: Arc<dyn LogSink>,
     /// 对外自报的客户端版本，由调用方从 `app.package_info().version` 注入
     version: String,
+    /// 插件心跳状态表。跨请求共享且需可变，故用 Mutex 包裹——
+    /// 心跳每 5 秒一次、指令队列极短，锁竞争可忽略
+    heartbeats: Arc<Mutex<HeartbeatRegistry>>,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -110,14 +115,40 @@ async fn ingest_log(
     (StatusCode::OK, Json(LogAck { received: count }))
 }
 
-fn build_router(sink: Arc<dyn LogSink>, version: &str) -> Router {
+/// 接收插件心跳并把待执行指令捎回。
+///
+/// 插件活在浏览器沙箱内、没有可被连接的地址，客户端无法主动连它——故用
+/// 「插件轮询 + 响应捎带指令」这一种形态完成双向通信（详见 heartbeat 模块头）。
+///
+/// 与 /log 一样对失败宽容：心跳解析异常也不返回错误码，避免插件因心跳失败
+/// 干扰采购主业务
+async fn ingest_heartbeat(
+    State(state): State<AppState>,
+    Json(req): Json<HeartbeatRequest>,
+) -> (StatusCode, Json<HeartbeatResponse>) {
+    let resp = match state.heartbeats.lock() {
+        Ok(mut reg) => reg.on_heartbeat(&req, Instant::now()),
+        // 锁被毒化（某次持锁时 panic）时不应连带打挂心跳链路，
+        // 退化为「本次不下发指令」，插件下次心跳仍会重试
+        Err(_) => HeartbeatResponse { commands: vec![] },
+    };
+    (StatusCode::OK, Json(resp))
+}
+
+fn build_router(
+    sink: Arc<dyn LogSink>,
+    version: &str,
+    heartbeats: Arc<Mutex<HeartbeatRegistry>>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/log", post(ingest_log))
+        .route("/heartbeat", post(ingest_heartbeat))
         .layer(build_cors_layer())
         .with_state(AppState {
             sink,
             version: version.to_string(),
+            heartbeats,
         })
 }
 
@@ -152,7 +183,13 @@ fn build_cors_layer() -> tower_http::cors::CorsLayer {
 /// * `sink` - 日志写入策略
 /// * `version` - 对外自报的客户端版本，须传 `app.package_info().version`，
 ///   与 updater 比对所用版本同源
-pub fn spawn(sink: Arc<dyn LogSink>, version: &str) -> Result<u16, String> {
+/// * `heartbeats` - 心跳状态表，由调用方持有同一实例并交给自愈巡检任务，
+///   两边必须共享——巡检要读 HTTP 侧写入的 last_seen，也要往队列塞指令
+pub fn spawn(
+    sink: Arc<dyn LogSink>,
+    version: &str,
+    heartbeats: Arc<Mutex<HeartbeatRegistry>>,
+) -> Result<u16, String> {
     let listener = bind_loopback()?;
     let port = listener
         .local_addr()
@@ -182,7 +219,9 @@ pub fn spawn(sink: Arc<dyn LogSink>, version: &str) -> Result<u16, String> {
                     return;
                 }
             };
-            if let Err(e) = axum::serve(listener, build_router(sink, &version)).await {
+            if let Err(e) =
+                axum::serve(listener, build_router(sink, &version, heartbeats)).await
+            {
                 eprintln!("日志服务异常退出: {}", e);
             }
         });
@@ -211,6 +250,15 @@ fn bind_loopback() -> Result<std::net::TcpListener, String> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// 构造测试用 AppState。心跳表每次新建，各用例互不干扰
+    fn test_state(sink: Arc<dyn LogSink>, version: &str) -> AppState {
+        AppState {
+            sink,
+            version: version.into(),
+            heartbeats: Arc::new(Mutex::new(HeartbeatRegistry::new())),
+        }
+    }
 
     /// 收集写入内容的测试替身
     struct MemSink {
@@ -290,10 +338,7 @@ mod tests {
             },
         ];
         let (status, ack) = ingest_log(
-            State(AppState {
-                sink: sink.clone() as Arc<dyn LogSink>,
-                version: "0.0.0-test".into(),
-            }),
+            State(test_state(sink.clone() as Arc<dyn LogSink>, "0.0.0-test")),
             Json(entries),
         )
         .await;
@@ -329,11 +374,9 @@ mod tests {
             plugin_name: Some("aichat".into()),
             message: "来自 1688 页面".into(),
         }];
-        ingest_log(
-            State(AppState {
-                sink: sink.clone() as Arc<dyn LogSink>,
-                version: "0.0.0-test".into(),
-            }),
+        // 本用例只关心落盘内容，返回值无需断言
+        let _ = ingest_log(
+            State(test_state(sink.clone() as Arc<dyn LogSink>, "0.0.0-test")),
             Json(entries),
         )
         .await;
@@ -364,10 +407,7 @@ mod tests {
             message: "字段缺失".into(),
         }];
         let (status, _) = ingest_log(
-            State(AppState {
-                sink: sink.clone() as Arc<dyn LogSink>,
-                version: "0.0.0-test".into(),
-            }),
+            State(test_state(sink.clone() as Arc<dyn LogSink>, "0.0.0-test")),
             Json(entries),
         )
         .await;
@@ -394,10 +434,7 @@ mod tests {
             lines: Mutex::new(Vec::new()),
         });
         let injected = "9.9.9-injected";
-        let resp = health(State(AppState {
-            sink: sink as Arc<dyn LogSink>,
-            version: injected.into(),
-        }))
+        let resp = health(State(test_state(sink as Arc<dyn LogSink>, injected)))
         .await;
 
         assert!(resp.ok, "健康检查应返回 ok=true");
@@ -421,7 +458,11 @@ mod tests {
         let sink = Arc::new(MemSink {
             lines: Mutex::new(Vec::new()),
         });
-        build_router(sink as Arc<dyn LogSink>, "0.0.0-test")
+        build_router(
+            sink as Arc<dyn LogSink>,
+            "0.0.0-test",
+            Arc::new(Mutex::new(HeartbeatRegistry::new())),
+        )
     }
 
     #[tokio::test]
@@ -463,6 +504,69 @@ mod tests {
                 .map(|v| v.contains("content-type") || v == "*")
                 .unwrap_or(false),
             "需允许 content-type 请求头，插件以 application/json 提交日志"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_endpoint_is_routed_and_returns_commands_field() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        // 端点必须真的挂上路由：漏挂时插件侧会收到 404，而心跳失败是静默的，
+        // 排查起来只能看到「客户端没反应」
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/heartbeat")
+            .header("origin", "https://www.1688.com")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"pluginName":"robot-01","sidepanelOpen":true,"taskRunning":false,"acked":[]}"#,
+            ))
+            .expect("构造心跳请求失败");
+
+        let resp = test_router().oneshot(req).await.expect("心跳请求执行失败");
+        assert!(resp.status().is_success(), "心跳应返回 2xx");
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "心跳同样来自 1688 等第三方页面，必须带 CORS 头否则被浏览器拦截"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("读取响应体失败");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("响应体应为合法 JSON");
+        assert!(
+            json.get("commands").map(|c| c.is_array()).unwrap_or(false),
+            "响应必须含 commands 数组——插件靠它取回待执行指令：{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tolerates_missing_optional_fields() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+
+        // 插件旧版本可能不带新增字段，缺字段不应 400——
+        // 否则升级期间新客户端会把旧插件的心跳全部拒掉，反而制造失联
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/heartbeat")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"pluginName":"robot-01"}"#))
+            .expect("构造精简心跳请求失败");
+
+        let resp = test_router().oneshot(req).await.expect("请求执行失败");
+        assert!(
+            resp.status().is_success(),
+            "字段缺失的心跳应被接受（走默认值），实际状态码 {}",
+            resp.status()
         );
     }
 

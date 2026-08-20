@@ -439,22 +439,6 @@ function App() {
     }
   }
 
-  /// 手动触发「重启 Chrome + 打开侧边栏」（二级自愈的完整动作）。
-  /// 代价较大（用户标签页会重开），故加二次确认；自愈流程会在插件
-  /// 完全无响应时自动调用同一命令
-  async function handleRestartChrome() {
-    if (!confirm("将关闭并重新打开 Chrome，当前标签页会重新加载。确定继续？")) {
-      return;
-    }
-    setSidepanelHint("正在重启 Chrome，请稍候…");
-    try {
-      const result = await invoke<string>("restart_chrome_and_open_sidepanel");
-      setSidepanelHint(result);
-    } catch (e) {
-      setSidepanelHint(`重启 Chrome 失败: ${e}`);
-    }
-  }
-
   async function postUpdateChromeActions() {
     try {
       const refreshResult = await invoke<string>("refresh_chrome_tabs");
@@ -711,9 +695,6 @@ function App() {
           <div className="machine-status-actions">
             <button className="btn-secondary" onClick={handleOpenSidepanel}>
               打开插件侧边栏
-            </button>
-            <button className="btn-secondary" onClick={handleRestartChrome}>
-              重启 Chrome
             </button>
             {sidepanelHint && (
               <span className="machine-status-hint">{sidepanelHint}</span>
