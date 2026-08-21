@@ -52,6 +52,20 @@ pub struct HeartbeatRequest {
     /// 是否有任务正在执行。有任务时不应打断，reload 需延后
     #[serde(default)]
     pub task_running: Option<bool>,
+    /// 业务 WebSocket 是否连接（插件侧 WS_CONNECTED）。
+    /// WS 断开即收不到任务，实例白跑——这是开发日常巡检必查的一项
+    #[serde(default)]
+    pub ws_connected: Option<bool>,
+    /// 1688 是否已登录。登出后任务全部失败，同为日常巡检必查项
+    #[serde(default)]
+    pub login_1688: Option<bool>,
+    /// 接口返回的「应绑定 1688 账号」，与 `actual_account` 比对可发现串号
+    #[serde(default)]
+    pub expected_account: Option<String>,
+    /// 实际登录的 1688 账号。与应绑定账号不一致意味着登错号，
+    /// 会导致询价发给错误的供应商账号
+    #[serde(default)]
+    pub actual_account: Option<String>,
     /// 上一轮已执行完的指令 id，客户端据此出队
     #[serde(default)]
     pub acked: Vec<String>,
@@ -78,6 +92,14 @@ pub struct PluginState {
     pub last_seen: Instant,
     pub sidepanel_open: bool,
     pub task_running: bool,
+    /// 业务 WS 是否连接（None = 插件未上报，老版本插件兼容）
+    pub ws_connected: Option<bool>,
+    /// 1688 是否已登录（None = 未上报）
+    pub login_1688: Option<bool>,
+    /// 应绑定的 1688 账号
+    pub expected_account: Option<String>,
+    /// 实际登录的 1688 账号
+    pub actual_account: Option<String>,
     /// 待下发指令队列（已下发但未收到 ack 的仍留在队列里，故会重复下发）
     pub pending: Vec<Command>,
     /// 已下发 reload 但插件尚未恢复心跳时，避免每轮都重复入队
@@ -100,6 +122,10 @@ impl PluginState {
             last_seen: now,
             sidepanel_open: false,
             task_running: false,
+            ws_connected: None,
+            login_1688: None,
+            expected_account: None,
+            actual_account: None,
             pending: Vec::new(),
             reload_issued: false,
             restart_count: 0,
@@ -140,6 +166,34 @@ pub enum HealAction {
     SidepanelClosedSilently,
 }
 
+/// 单个实例的巡检快照，供客户端界面展示（DEV-125034）。
+///
+/// # 为什么需要它
+/// 开发原本每天要逐个点开 15 个浏览器，逐一查看 WS 是否连接、1688 是否
+/// 登出、窗口是否被最小化。这些判断插件内部本来就在做（badge 巡检、
+/// StatusBar 账号比对），只是各自展示在自己的 sidepanel/badge 里。
+/// 客户端本就在接收全部实例的心跳，汇总本该由它做。
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSnapshot {
+    pub plugin_name: String,
+    /// 距上次心跳的秒数。越大越可疑
+    pub silence_secs: u64,
+    /// 是否已判定失联（超过一级阈值）
+    pub stale: bool,
+    pub sidepanel_open: bool,
+    pub task_running: bool,
+    pub ws_connected: Option<bool>,
+    pub login_1688: Option<bool>,
+    pub expected_account: Option<String>,
+    pub actual_account: Option<String>,
+    /// 账号是否串号：两个账号都已上报且不一致。
+    /// 单独给出而非让前端比对，是因为「未上报」与「不一致」必须区分开
+    pub account_mismatch: bool,
+    /// 是否存在任一异常，供界面标红置顶
+    pub has_issue: bool,
+}
+
 /// 心跳状态表。多个插件（理论上一台机器一个，但不假设唯一）各自独立计数
 #[derive(Debug, Default)]
 pub struct HeartbeatRegistry {
@@ -174,6 +228,20 @@ impl HeartbeatRegistry {
         state.last_seen = now;
         state.sidepanel_open = req.sidepanel_open.unwrap_or(false);
         state.task_running = req.task_running.unwrap_or(false);
+        // 巡检字段：仅在插件上报时覆盖，未上报（老版本插件）保留上次值而非
+        // 清成 None——否则新旧版本插件混跑时看板会闪烁
+        if req.ws_connected.is_some() {
+            state.ws_connected = req.ws_connected;
+        }
+        if req.login_1688.is_some() {
+            state.login_1688 = req.login_1688;
+        }
+        if req.expected_account.is_some() {
+            state.expected_account = req.expected_account.clone();
+        }
+        if req.actual_account.is_some() {
+            state.actual_account = req.actual_account.clone();
+        }
 
         // 消费 ack：插件已执行完的指令出队
         if !req.acked.is_empty() {
@@ -185,6 +253,71 @@ impl HeartbeatRegistry {
         HeartbeatResponse {
             commands: state.pending.clone(),
         }
+    }
+
+    /// 生成全部实例的巡检快照，异常的排在前面。
+    ///
+    /// 排序规则：有问题的优先，其次按静默时长倒序，最后按名字——
+    /// 15 行表格里，需要处理的必须一眼看到，不该让人自己扫。
+    pub fn snapshots(&self, now: Instant) -> Vec<PluginSnapshot> {
+        let mut list: Vec<PluginSnapshot> = self
+            .plugins
+            .iter()
+            .map(|(name, s)| {
+                let silence = now.saturating_duration_since(s.last_seen);
+                let stale = silence >= RELOAD_THRESHOLD;
+                // 账号串号：两边都上报了才比对。任一为空是「没上报」，
+                // 不能当成「不一致」——那会让老版本插件全部误报串号
+                let account_mismatch = match (&s.expected_account, &s.actual_account) {
+                    (Some(e), Some(a)) if !e.is_empty() && !a.is_empty() => e != a,
+                    _ => false,
+                };
+                let has_issue = stale
+                    || !s.sidepanel_open
+                    || s.ws_connected == Some(false)
+                    || s.login_1688 == Some(false)
+                    || account_mismatch;
+                PluginSnapshot {
+                    plugin_name: name.clone(),
+                    silence_secs: silence.as_secs(),
+                    stale,
+                    sidepanel_open: s.sidepanel_open,
+                    task_running: s.task_running,
+                    ws_connected: s.ws_connected,
+                    login_1688: s.login_1688,
+                    expected_account: s.expected_account.clone(),
+                    actual_account: s.actual_account.clone(),
+                    account_mismatch,
+                    has_issue,
+                }
+            })
+            .collect();
+        list.sort_by(|a, b| {
+            b.has_issue
+                .cmp(&a.has_issue)
+                .then(b.silence_secs.cmp(&a.silence_secs))
+                .then(a.plugin_name.cmp(&b.plugin_name))
+        });
+        list
+    }
+
+    /// 给指定实例入队一条指令（供界面手动下发，如重连 WS）。
+    ///
+    /// 返回指令 id；实例不存在时返回 None——不为未知实例建状态，
+    /// 否则界面上一次误操作就会凭空多出一行僵尸记录
+    pub fn enqueue_command(&mut self, plugin_name: &str, kind: &str) -> Option<String> {
+        let id = format!("cmd-{}", self.seq);
+        let state = self.plugins.get_mut(plugin_name)?;
+        // 同类指令已在队列里就不重复入队：连点两次按钮不该让插件重连两次
+        if state.pending.iter().any(|c| c.kind == kind) {
+            return None;
+        }
+        state.pending.push(Command {
+            id: id.clone(),
+            kind: kind.to_string(),
+        });
+        self.seq += 1;
+        Some(id)
     }
 
     /// 巡检所有插件，返回每个插件应采取的动作。
@@ -307,8 +440,190 @@ mod tests {
             plugin_name: Some(name.to_string()),
             sidepanel_open: Some(sidepanel),
             task_running: Some(false),
+            ws_connected: None,
+            login_1688: None,
+            expected_account: None,
+            actual_account: None,
             acked,
         }
+    }
+
+    /// 带巡检字段的心跳，用于看板相关用例
+    fn patrol_req(
+        name: &str,
+        ws: Option<bool>,
+        login: Option<bool>,
+        expected: Option<&str>,
+        actual: Option<&str>,
+    ) -> HeartbeatRequest {
+        HeartbeatRequest {
+            plugin_name: Some(name.to_string()),
+            sidepanel_open: Some(true),
+            task_running: Some(false),
+            ws_connected: ws,
+            login_1688: login,
+            expected_account: expected.map(|s| s.to_string()),
+            actual_account: actual.map(|s| s.to_string()),
+            acked: vec![],
+        }
+    }
+
+    #[test]
+    fn test_snapshot_reports_patrol_fields() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(
+            &patrol_req("robot-01", Some(true), Some(true), Some("acc-a"), Some("acc-a")),
+            now,
+        );
+
+        let snaps = reg.snapshots(now);
+        assert_eq!(snaps.len(), 1);
+        let s = &snaps[0];
+        assert_eq!(s.ws_connected, Some(true));
+        assert_eq!(s.login_1688, Some(true));
+        assert!(!s.account_mismatch);
+        assert!(!s.has_issue, "各项正常时不应标记为异常");
+    }
+
+    #[test]
+    fn test_snapshot_flags_ws_disconnected_as_issue() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(false), Some(true), None, None), now);
+
+        let s = &reg.snapshots(now)[0];
+        assert!(
+            s.has_issue,
+            "WS 断开必须标记为异常——断开即收不到任务，实例白跑"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_flags_logged_out_as_issue() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(false), None, None), now);
+
+        assert!(
+            reg.snapshots(now)[0].has_issue,
+            "1688 登出必须标记为异常——登出后任务全部失败"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_detects_account_mismatch() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(
+            &patrol_req("robot-01", Some(true), Some(true), Some("acc-a"), Some("acc-b")),
+            now,
+        );
+
+        let s = &reg.snapshots(now)[0];
+        assert!(
+            s.account_mismatch,
+            "应绑定与实际登录账号不一致必须报出——登错号会把询价发给错误的供应商账号"
+        );
+        assert!(s.has_issue);
+    }
+
+    #[test]
+    fn test_snapshot_missing_account_is_not_mismatch() {
+        // 老版本插件不上报账号字段，不能因此全部误报串号
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(true), None, None), now);
+
+        let s = &reg.snapshots(now)[0];
+        assert!(
+            !s.account_mismatch,
+            "账号未上报应视为「不知道」而非「不一致」，否则老版本插件会全部误报"
+        );
+        assert!(!s.has_issue);
+    }
+
+    #[test]
+    fn test_snapshot_puts_problem_instances_first() {
+        // 15 行表格里需要处理的必须一眼看到
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(true), None, None), now);
+        reg.on_heartbeat(&patrol_req("robot-02", Some(false), Some(true), None, None), now);
+        reg.on_heartbeat(&patrol_req("robot-03", Some(true), Some(true), None, None), now);
+
+        let snaps = reg.snapshots(now);
+        assert_eq!(
+            snaps[0].plugin_name, "robot-02",
+            "异常实例必须排在最前，实际顺序: {:?}",
+            snaps.iter().map(|s| &s.plugin_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_marks_stale_instance() {
+        let mut reg = HeartbeatRegistry::new();
+        let t0 = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(true), None, None), t0);
+
+        let snaps = reg.snapshots(t0 + RELOAD_THRESHOLD);
+        assert!(snaps[0].stale, "超过一级阈值应标记 stale");
+        assert!(snaps[0].has_issue);
+        assert_eq!(snaps[0].silence_secs, RELOAD_THRESHOLD.as_secs());
+    }
+
+    #[test]
+    fn test_patrol_fields_not_cleared_when_omitted() {
+        // 新旧版本插件混跑时，未上报的字段应保留上次值而非清空，否则看板闪烁
+        let mut reg = HeartbeatRegistry::new();
+        let t0 = Instant::now();
+        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(true), None, None), t0);
+        // 老版本格式的心跳（不带巡检字段）
+        reg.on_heartbeat(&req("robot-01", true, vec![]), t0 + Duration::from_secs(5));
+
+        let s = &reg.snapshots(t0 + Duration::from_secs(5))[0];
+        assert_eq!(
+            s.ws_connected,
+            Some(true),
+            "未上报的巡检字段应保留上次值，不应被清成 None"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_command_delivers_on_next_heartbeat() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&req("robot-01", true, vec![]), now);
+
+        let id = reg
+            .enqueue_command("robot-01", "reconnectWs")
+            .expect("已知实例应能入队指令");
+        let resp = reg.on_heartbeat(&req("robot-01", true, vec![]), now);
+        assert_eq!(resp.commands.len(), 1);
+        assert_eq!(resp.commands[0].kind, "reconnectWs");
+        assert_eq!(resp.commands[0].id, id);
+    }
+
+    #[test]
+    fn test_enqueue_command_rejects_unknown_plugin() {
+        let mut reg = HeartbeatRegistry::new();
+        assert!(
+            reg.enqueue_command("robot-99", "reconnectWs").is_none(),
+            "不得为未知实例建状态，否则界面误操作会凭空多出僵尸记录"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_command_deduplicates_same_kind() {
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        reg.on_heartbeat(&req("robot-01", true, vec![]), now);
+
+        assert!(reg.enqueue_command("robot-01", "reconnectWs").is_some());
+        assert!(
+            reg.enqueue_command("robot-01", "reconnectWs").is_none(),
+            "同类指令已在队列时不应重复入队——连点两次按钮不该让插件重连两次"
+        );
     }
 
     #[test]
@@ -676,6 +991,10 @@ mod tests {
             plugin_name: None,
             sidepanel_open: Some(true),
             task_running: Some(false),
+            ws_connected: None,
+            login_1688: None,
+            expected_account: None,
+            actual_account: None,
             acked: vec![],
         };
         reg.on_heartbeat(&r, now);

@@ -664,6 +664,89 @@
   font-size: 13px;
 }
 
+/* ───────── 插件巡检看板（DEV-125034） ───────── */
+
+/* 窗口固定 600px 宽，8 列表格挤不开会把表头压成竖排（「侧边栏」三个字
+   竖着排、「已打开」断成三行，完全没法读）。故给表格设最小宽度、
+   由外层容器横向滚动，而不是让浏览器逐字折行 */
+.patrol-view .log-table {
+  min-width: 820px;
+}
+
+.patrol-view .log-table th,
+.patrol-view .log-table td {
+  white-space: nowrap;
+}
+
+/* 账号列是唯一可能很长的内容（串号时要显示两个账号），
+   允许它折行，其余列保持单行 */
+.patrol-view .log-table td.patrol-account {
+  white-space: normal;
+  min-width: 180px;
+}
+
+.patrol-view .log-table-wrap {
+  overflow-x: auto;
+}
+
+.patrol-summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: #666;
+}
+
+.patrol-issue-count {
+  color: #dc2626;
+}
+
+.patrol-hint {
+  color: #2563eb;
+}
+
+/* 异常行整行淡红底 + 左侧红条，扫一眼就能定位 */
+.patrol-row-issue {
+  background: #fff5f5;
+  box-shadow: inset 3px 0 0 #dc2626;
+}
+
+/* 深色模式下淡红底会让原本的浅灰字几乎看不见（实测 robot-01 行的实例名
+   与「运行中」发灰不可读），故异常行内文字统一压深，不跟随全局浅色 */
+.patrol-row-issue td {
+  color: #3f3f46;
+}
+
+.patrol-ok {
+  color: #16a34a;
+}
+
+.patrol-bad {
+  color: #dc2626;
+  font-weight: 500;
+}
+
+/* 状态色需盖过上面异常行的 td 兜底色，否则绿/红会被压成深灰 */
+.patrol-row-issue td.patrol-ok {
+  color: #15803d;
+}
+
+.patrol-row-issue td.patrol-bad {
+  color: #b91c1c;
+}
+
+.btn-mini {
+  padding: 2px 10px;
+  font-size: 11px;
+}
+
+.btn-mini:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* 分页页脚：显示已加载/总条数，并在还有剩余时提供「加载更多」 */
 .log-page-footer {
   display: flex;

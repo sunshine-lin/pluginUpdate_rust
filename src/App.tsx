@@ -31,6 +31,30 @@ interface LogEntry {
   message: string;
 }
 
+/// 单个插件实例的巡检快照（DEV-125034）
+interface PluginSnapshot {
+  pluginName: string;
+  silenceSecs: number;
+  stale: boolean;
+  sidepanelOpen: boolean;
+  taskRunning: boolean;
+  wsConnected: boolean | null;
+  login1688: boolean | null;
+  expectedAccount: string | null;
+  actualAccount: string | null;
+  accountMismatch: boolean;
+  hasIssue: boolean;
+}
+
+interface PatrolReport {
+  instances: PluginSnapshot[];
+  chromeWindows: number;
+  minimizedWindows: number;
+}
+
+/// 巡检看板刷新间隔。心跳每 5 秒一次，看板同频即可
+const PATROL_REFRESH_MS = 5000;
+
 /// 后端分页查询的返回（DEV-122550）。total 是命中筛选的总条数，
 /// 与 entries.length 不同——后者只是当前这一页
 interface LogPage {
@@ -54,7 +78,7 @@ interface SystemSnapshot {
   os_version: string;
 }
 
-type View = "update" | "logs" | "machine";
+type View = "update" | "logs" | "machine" | "patrol";
 
 /// 机器状态页的刷新间隔：3 秒。CPU 占用率类数据需要能看出实时变化，
 /// 但采购同事的机器同时还在跑插件，间隔太短会增加不必要的采样开销
@@ -123,6 +147,9 @@ function App() {
   const [logLoadedPages, setLogLoadedPages] = useState<number>(1);
   // 筛选条件的防抖版本：关键词逐字输入不该每个字符都打一次后端
   const [debouncedKeyword, setDebouncedKeyword] = useState<string>("");
+  // 巡检看板（DEV-125034）
+  const [patrol, setPatrol] = useState<PatrolReport | null>(null);
+  const [patrolHint, setPatrolHint] = useState<string>("");
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
@@ -339,6 +366,35 @@ function App() {
     logLoadedPages,
   ]);
 
+  // 巡检看板：仅在该页时轮询，避免后台白跑
+  useEffect(() => {
+    if (view !== "patrol") return;
+    const refresh = () => {
+      invoke<PatrolReport>("get_patrol_report")
+        .then(setPatrol)
+        .catch((e) => setPatrolHint(`读取巡检数据失败: ${e}`));
+    };
+    refresh();
+    const timer = setInterval(refresh, PATROL_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [view]);
+
+  /// 给某个实例下发重连 WS 指令。
+  /// 走心跳通道（路径 A）——天然定向到该实例、不抢焦点、无手势要求，
+  /// 是当前唯一能真正闭环的自愈手段
+  async function handleReconnectWs(pluginName: string) {
+    setPatrolHint(`正在向 ${pluginName} 下发重连指令…`);
+    try {
+      const result = await invoke<string>("send_plugin_command", {
+        pluginName,
+        kind: "reconnectWs",
+      });
+      setPatrolHint(result);
+    } catch (e) {
+      setPatrolHint(`下发失败: ${e}`);
+    }
+  }
+
   // 机器状态：常驻定时刷新（不只在「机器状态」页才采样），
   // 供标题栏简化指示器随时显示，无需切到该页才能看到负载情况
   useEffect(() => {
@@ -504,7 +560,11 @@ function App() {
   }
 
   return (
-    <main className={view === "logs" ? "container container-wide" : "container"}>
+    <main
+      className={
+        view === "logs" || view === "patrol" ? "container container-wide" : "container"
+      }
+    >
       <div className="view-tabs">
         <button
           className={`view-tab-btn ${view === "update" ? "view-tab-active" : ""}`}
@@ -517,6 +577,12 @@ function App() {
           onClick={() => setView("logs")}
         >
           日志查看
+        </button>
+        <button
+          className={`view-tab-btn ${view === "patrol" ? "view-tab-active" : ""}`}
+          onClick={() => setView("patrol")}
+        >
+          插件巡检
         </button>
         <button
           className={`view-tab-btn ${view === "machine" ? "view-tab-active" : ""}`}
@@ -722,6 +788,101 @@ function App() {
                 ) : null}
               </div>
             ) : null}
+          </div>
+        </div>
+      ) : view === "patrol" ? (
+        /* 插件巡检看板（DEV-125034）：替代「逐个点开 15 个浏览器」的日常巡检。
+           异常实例已由后端排在最前，一眼能看到该处理谁 */
+        <div className="patrol-view">
+          <div className="patrol-summary">
+            <span>
+              实例 {patrol?.instances.length ?? 0} 个
+              {patrol && patrol.instances.some((i) => i.hasIssue) && (
+                <b className="patrol-issue-count">
+                  ，{patrol.instances.filter((i) => i.hasIssue).length} 个异常
+                </b>
+              )}
+            </span>
+            <span>
+              Chrome 窗口 {patrol?.chromeWindows ?? 0} 个
+              {(patrol?.minimizedWindows ?? 0) > 0 &&
+                `（${patrol?.minimizedWindows} 个已最小化）`}
+            </span>
+            {patrolHint && <span className="patrol-hint">{patrolHint}</span>}
+          </div>
+          <div className="log-table-wrap">
+            {!patrol || patrol.instances.length === 0 ? (
+              <div className="log-empty">
+                暂无插件上报心跳。确认插件已安装并打开侧边栏，且客户端日志服务已启动
+              </div>
+            ) : (
+              <table className="log-table">
+                <thead>
+                  <tr>
+                    <th>实例</th>
+                    <th>心跳</th>
+                    <th>侧边栏</th>
+                    <th>WS</th>
+                    <th>1688</th>
+                    <th>账号</th>
+                    <th>任务</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {patrol.instances.map((it) => (
+                    <tr key={it.pluginName} className={it.hasIssue ? "patrol-row-issue" : ""}>
+                      <td>{it.pluginName}</td>
+                      <td className={it.stale ? "patrol-bad" : "patrol-ok"}>
+                        {it.stale ? `失联 ${it.silenceSecs}s` : `${it.silenceSecs}s 前`}
+                      </td>
+                      <td className={it.sidepanelOpen ? "patrol-ok" : "patrol-bad"}>
+                        {it.sidepanelOpen ? "已打开" : "未打开"}
+                      </td>
+                      <td
+                        className={
+                          it.wsConnected === null
+                            ? ""
+                            : it.wsConnected
+                              ? "patrol-ok"
+                              : "patrol-bad"
+                        }
+                      >
+                        {it.wsConnected === null ? "—" : it.wsConnected ? "已连接" : "已断开"}
+                      </td>
+                      <td
+                        className={
+                          it.login1688 === null ? "" : it.login1688 ? "patrol-ok" : "patrol-bad"
+                        }
+                      >
+                        {it.login1688 === null ? "—" : it.login1688 ? "已登录" : "未登录"}
+                      </td>
+                      {/* 账号列：串号时把两个账号都显示出来，否则光说「不一致」没法判断该改哪边 */}
+                      <td
+                        className={`patrol-account ${it.accountMismatch ? "patrol-bad" : ""}`}
+                      >
+                        {it.accountMismatch
+                          ? `串号：应为 ${it.expectedAccount}，实为 ${it.actualAccount}`
+                          : (it.actualAccount ?? "—")}
+                      </td>
+                      <td>{it.taskRunning ? "运行中" : "空闲"}</td>
+                      <td>
+                        {/* 重连走心跳通道，定向到该实例、不抢焦点。
+                            插件已失联时取不走指令，故禁用按钮 */}
+                        <button
+                          className="btn-secondary btn-mini"
+                          disabled={it.stale}
+                          title={it.stale ? "实例已失联，取不走指令" : "下发重连 WS 指令"}
+                          onClick={() => handleReconnectWs(it.pluginName)}
+                        >
+                          重连 WS
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
       ) : view === "machine" ? (

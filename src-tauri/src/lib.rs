@@ -8,6 +8,7 @@ pub mod heartbeat;
 pub mod log_file;
 pub mod log_server;
 pub mod updater_manifest;
+pub mod ws_token;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateInfo {
@@ -603,6 +604,12 @@ const HEAL_INSPECT_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 static LOG_SINK: std::sync::OnceLock<std::sync::Arc<dyn log_server::LogSink>> =
     std::sync::OnceLock::new();
 
+/// 心跳状态表的全局句柄，供巡检看板相关命令读取（DEV-125034）。
+/// 与 HTTP 服务、自愈巡检共享同一实例——三者必须看到同一份状态
+static HEARTBEATS: std::sync::OnceLock<
+    std::sync::Arc<std::sync::Mutex<heartbeat::HeartbeatRegistry>>,
+> = std::sync::OnceLock::new();
+
 /// 构建客户端自身错误的日志行（可测试的纯函数部分）
 pub fn build_client_error_line(message: &str) -> String {
     format_log_line(&current_timestamp(), "error", "client", "client", message)
@@ -765,6 +772,133 @@ fn refresh_chrome_tabs() -> Result<String, String> {
 #[tauri::command]
 fn open_plugin_sidepanel() -> Result<String, String> {
     run_open_sidepanel_os()
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 巡检看板（DEV-125034）
+//
+// 替代人工日常巡检：开发原本每天要逐个点开 15 个浏览器，逐一查看 WS 是否
+// 连接、1688 是否登出、窗口是否被最小化。这些判断插件内部本来就在做，只是
+// 各自展示在自己的 sidepanel/badge 里；客户端本就在收全部实例的心跳，
+// 汇总本该由它做。
+// ─────────────────────────────────────────────────────────────────
+
+/// 构建 Windows PowerShell 命令：列出所有 Chrome 窗口及其是否最小化。
+///
+/// 输出每行 `<进程id>|<0或1>`，1 表示最小化。用 WindowStyle 判断而非
+/// IsIconic：前者 PowerShell 直接可读，不必 P/Invoke user32
+pub fn build_list_chrome_windows_command_windows() -> String {
+    "Get-Process -Name chrome -ErrorAction SilentlyContinue | \
+     Where-Object { $_.MainWindowHandle -ne 0 } | \
+     ForEach-Object { \
+       $min = if ($_.MainWindowTitle -eq '') { 1 } else { 0 }; \
+       Write-Output \"$($_.Id)|$min\" \
+     }"
+    .to_string()
+}
+
+/// 解析上面命令的输出，返回 (进程id, 是否最小化) 列表。
+///
+/// 容忍空行与格式异常行（跳过而非整体失败）——巡检看板缺一行数据
+/// 远好过整个页面报错
+pub fn parse_chrome_window_states(output: &str) -> Vec<(u32, bool)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pid, min) = line.trim().split_once('|')?;
+            Some((pid.trim().parse::<u32>().ok()?, min.trim() == "1"))
+        })
+        .collect()
+}
+
+/// 巡检看板数据：实例状态 + 窗口概况。
+/// 字段统一驼峰，与 PluginSnapshot 保持一致，免得前端两种风格混用
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PatrolReport {
+    /// 各实例快照，异常的已排在前面
+    instances: Vec<heartbeat::PluginSnapshot>,
+    /// Chrome 窗口总数（客户端直接枚举得到，插件侧拿不到）
+    chrome_windows: usize,
+    /// 其中已最小化的窗口数
+    minimized_windows: usize,
+}
+
+/// 读取巡检看板数据
+#[tauri::command]
+fn get_patrol_report() -> Result<PatrolReport, String> {
+    let instances = match HEARTBEATS.get() {
+        Some(reg) => match reg.lock() {
+            Ok(r) => r.snapshots(std::time::Instant::now()),
+            // 锁被毒化时返回空列表而非报错：看板打不开比少一次数据更糟
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let windows = list_chrome_windows_os().unwrap_or_default();
+    Ok(PatrolReport {
+        chrome_windows: windows.len(),
+        minimized_windows: windows.iter().filter(|(_, min)| *min).count(),
+        instances,
+    })
+}
+
+/// 给指定实例下发一条指令（当前用于重连 WS）。
+///
+/// 走「路径 A」——指令通过心跳响应捎给发心跳的那个实例，天然定向、
+/// 不抢焦点、无手势要求。这是当前唯一能真正闭环的自愈手段：侧边栏仍
+/// 开着，重连后立刻可继续干活（不像 reload 会连带打掉侧边栏）
+#[tauri::command]
+fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
+    // 只允许已知的安全指令，避免前端传入任意字符串
+    const ALLOWED: [&str; 1] = ["reconnectWs"];
+    if !ALLOWED.contains(&kind.as_str()) {
+        return Err(format!("不支持的指令类型: {}", kind));
+    }
+    let reg = HEARTBEATS.get().ok_or("心跳服务未启动")?;
+    let mut guard = reg.lock().map_err(|_| "心跳状态表不可用".to_string())?;
+    match guard.enqueue_command(&plugin_name, &kind) {
+        Some(_) => {
+            log_client_info(&format!("[巡检] 已向 {} 下发 {} 指令", plugin_name, kind));
+            Ok(format!("已下发，等待 {} 执行", plugin_name))
+        }
+        None => Ok("该指令已在队列中，或实例未上报过心跳".to_string()),
+    }
+}
+
+/// 枚举 Chrome 窗口及最小化状态
+#[cfg(target_os = "windows")]
+fn list_chrome_windows_os() -> Result<Vec<(u32, bool)>, String> {
+    let cmd = build_list_chrome_windows_command_windows();
+    let output = std::process::Command::new("powershell")
+        .args(["-Command", &cmd])
+        .output()
+        .map_err(|e| format!("枚举 Chrome 窗口失败: {}", e))?;
+    Ok(parse_chrome_window_states(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+/// macOS 下用 AppleScript 数 Chrome 窗口。仅供本机开发调试——
+/// 采购机器全部是 Windows
+#[cfg(target_os = "macos")]
+fn list_chrome_windows_os() -> Result<Vec<(u32, bool)>, String> {
+    let script = "tell application \"Google Chrome\" to get count of windows";
+    let output = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .map_err(|e| format!("枚举 Chrome 窗口失败: {}", e))?;
+    let n: usize = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    // macOS 分支不区分最小化，仅返回窗口数量占位
+    Ok((0..n).map(|i| (i as u32, false)).collect())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn list_chrome_windows_os() -> Result<Vec<(u32, bool)>, String> {
+    Ok(Vec::new())
 }
 
 /// 启动自愈巡检后台线程。
@@ -1125,6 +1259,8 @@ pub fn run() {
             let heartbeats = std::sync::Arc::new(std::sync::Mutex::new(
                 heartbeat::HeartbeatRegistry::new(),
             ));
+            // 供巡检看板命令读取同一份状态
+            let _ = HEARTBEATS.set(heartbeats.clone());
             match log_server::spawn(sink, &app_version, heartbeats.clone()) {
                 Ok(port) => {
                     LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
@@ -1167,6 +1303,8 @@ pub fn run() {
             get_system_snapshot,
             open_plugin_sidepanel,
             restart_chrome_and_open_sidepanel,
+            get_patrol_report,
+            send_plugin_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1829,6 +1967,50 @@ mod tests {
             parsed.get("autostart").and_then(|v| v.as_bool()),
             Some(true),
             "配置中应存在布尔字段 autostart，字段名变动会导致旧版本配置无法识别"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 巡检看板：Chrome 窗口枚举（DEV-125034）
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_chrome_window_states_reads_pid_and_minimized() {
+        let out = "1234|0\n5678|1\n";
+        let states = parse_chrome_window_states(out);
+        assert_eq!(states, vec![(1234, false), (5678, true)]);
+    }
+
+    #[test]
+    fn test_parse_chrome_window_states_skips_malformed_lines() {
+        // 巡检看板缺一行数据远好过整个页面报错
+        let out = "1234|0\n垃圾行\n\nabc|1\n5678|1\n";
+        let states = parse_chrome_window_states(out);
+        assert_eq!(
+            states,
+            vec![(1234, false), (5678, true)],
+            "格式异常行应跳过而非导致整体失败"
+        );
+    }
+
+    #[test]
+    fn test_parse_chrome_window_states_empty_output() {
+        assert!(
+            parse_chrome_window_states("").is_empty(),
+            "Chrome 未运行时应返回空列表而非报错"
+        );
+    }
+
+    #[test]
+    fn test_list_chrome_windows_command_targets_chrome_only() {
+        let cmd = build_list_chrome_windows_command_windows();
+        assert!(
+            cmd.contains("-Name chrome"),
+            "必须限定只枚举 chrome 进程，避免误列其它程序窗口"
+        );
+        assert!(
+            cmd.contains("MainWindowHandle -ne 0"),
+            "须过滤掉无窗口的后台进程——Chrome 一个实例有多个子进程，只有主进程有窗口"
         );
     }
 
