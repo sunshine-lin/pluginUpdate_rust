@@ -31,10 +31,17 @@ interface LogEntry {
   message: string;
 }
 
-interface LogEntriesResult {
+/// 后端分页查询的返回（DEV-122550）。total 是命中筛选的总条数，
+/// 与 entries.length 不同——后者只是当前这一页
+interface LogPage {
   entries: LogEntry[];
+  total: number;
   plugin_names: string[];
 }
+
+/// 单页拉取条数。与后端 DEFAULT_PAGE_LIMIT 一致；日志表格一屏撑不过百行，
+/// 500 条足够翻阅，再多只是白付 IPC 序列化与 DOM 渲染成本
+const LOG_PAGE_SIZE = 500;
 
 interface SystemSnapshot {
   total_memory_bytes: number;
@@ -110,6 +117,12 @@ function App() {
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logLoading, setLogLoading] = useState<boolean>(false);
   const [logError, setLogError] = useState<string>("");
+  // 命中筛选的总条数（后端给出，可能远大于已加载的 logEntries.length）
+  const [logTotal, setLogTotal] = useState<number>(0);
+  // 已加载的页数，用于「加载更多」计算 offset
+  const [logLoadedPages, setLogLoadedPages] = useState<number>(1);
+  // 筛选条件的防抖版本：关键词逐字输入不该每个字符都打一次后端
+  const [debouncedKeyword, setDebouncedKeyword] = useState<string>("");
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
@@ -258,22 +271,73 @@ function App() {
     });
   }, [view]);
 
-  // 日期变化时重新读取当天全量日志；级别/插件名/时间段/关键词都是对这份
-  // 内存数据做组合过滤，不用每次筛选变化都重新调用后端命令
+  // 关键词防抖：逐字输入不该每敲一个字符就打一次后端
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedKeyword(keyword), 300);
+    return () => clearTimeout(timer);
+  }, [keyword]);
+
+  // 日期或筛选条件变化时，回到第一页重新查
+  useEffect(() => {
+    setLogLoadedPages(1);
+  }, [selectedDate, selectedLevels, selectedPluginNames, timeFrom, timeTo, debouncedKeyword]);
+
+  // 读取当前页日志。筛选与分页都下推到后端（DEV-122550）——一台机器跑 3~15 个
+  // Chrome 实例，当天日志可达 GB 级，原先「全量拉取 + 前端内存过滤 + 全量渲染」
+  // 会在读文件、IPC 序列化、DOM 渲染三处各卡一次。
+  //
+  // 筛选不能只在前端已加载的那一页里做：日志页是用来排查问题的，筛选必须覆盖
+  // 当天全部数据，否则等于筛不到。
   useEffect(() => {
     if (view !== "logs" || !selectedDate) return;
     setLogLoading(true);
     setLogError("");
-    invoke<LogEntriesResult>("read_log_entries", { date: selectedDate, errorOnly: false })
+    // 级别/插件名全选时传空数组表示「不限」，避免把整份白名单塞进 IPC
+    const levels =
+      selectedLevels.size === ALL_LEVELS.length ? [] : Array.from(selectedLevels);
+    const pluginNames =
+      availablePluginNames.length > 0 &&
+      selectedPluginNames.size === availablePluginNames.length
+        ? []
+        : Array.from(selectedPluginNames);
+    invoke<LogPage>("read_log_page", {
+      date: selectedDate,
+      query: {
+        errorOnly: false,
+        levels,
+        pluginNames,
+        keyword: debouncedKeyword,
+        startTime: timeFrom,
+        endTime: timeTo,
+        offset: 0,
+        limit: LOG_PAGE_SIZE * logLoadedPages,
+      },
+    })
       .then((result) => {
         setLogEntries(result.entries);
-        setAvailablePluginNames(result.plugin_names);
-        // 默认全选当天出现过的插件名，且旧筛选状态不跨日期保留
-        setSelectedPluginNames(new Set(result.plugin_names));
+        setLogTotal(result.total);
+        setAvailablePluginNames((prev) => {
+          // 插件名下拉选项来自全部日志、不受当前筛选影响。仅在切换日期
+          // （选项集合真的变了）时重置勾选，否则每次筛选都会把勾选冲掉
+          const changed =
+            prev.length !== result.plugin_names.length ||
+            prev.some((p, i) => p !== result.plugin_names[i]);
+          if (changed) setSelectedPluginNames(new Set(result.plugin_names));
+          return changed ? result.plugin_names : prev;
+        });
       })
       .catch((e) => setLogError(`读取日志失败: ${e}`))
       .finally(() => setLogLoading(false));
-  }, [view, selectedDate]);
+  }, [
+    view,
+    selectedDate,
+    selectedLevels,
+    selectedPluginNames,
+    timeFrom,
+    timeTo,
+    debouncedKeyword,
+    logLoadedPages,
+  ]);
 
   // 机器状态：常驻定时刷新（不只在「机器状态」页才采样），
   // 供标题栏简化指示器随时显示，无需切到该页才能看到负载情况
@@ -312,24 +376,11 @@ function App() {
     });
   }
 
-  const filteredLogEntries = logEntries.filter((e) => {
-    if (!selectedLevels.has(e.level.toUpperCase())) return false;
-    if (!selectedPluginNames.has(e.plugin_name)) return false;
-    if (timeFrom || timeTo) {
-      // timestamp 可能是 "HH:mm:ss.SSS" 或 ISO 格式，取时间部分的 HH:mm 比较
-      const match = e.timestamp.match(/(\d{2}:\d{2})/);
-      const hm = match ? match[1] : "";
-      if (timeFrom && hm < timeFrom) return false;
-      if (timeTo && hm > timeTo) return false;
-    }
-    if (keyword.trim()) {
-      const kw = keyword.trim().toLowerCase();
-      if (!(e.message + e.source + e.level + e.plugin_name).toLowerCase().includes(kw)) {
-        return false;
-      }
-    }
-    return true;
-  });
+  // 筛选已下推到后端，这里直接用返回的条目——不再做一次前端全量过滤
+  // （原实现每次 render 都重算一遍，且没有 useMemo）
+  const filteredLogEntries = logEntries;
+  // 还有未加载的命中条目时显示「加载更多」
+  const hasMoreLogs = logEntries.length < logTotal;
 
   async function handleOpenLogDirFromLogsTab() {
     try {
@@ -653,6 +704,21 @@ function App() {
                 </tbody>
               </table>
             )}
+            {!logLoading && filteredLogEntries.length > 0 ? (
+              <div className="log-page-footer">
+                <span className="log-page-count">
+                  已显示 {filteredLogEntries.length} / 共 {logTotal} 条
+                </span>
+                {hasMoreLogs ? (
+                  <button
+                    className="log-load-more"
+                    onClick={() => setLogLoadedPages((p) => p + 1)}
+                  >
+                    加载更多
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : view === "machine" ? (

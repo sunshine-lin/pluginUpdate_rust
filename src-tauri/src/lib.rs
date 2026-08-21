@@ -734,6 +734,16 @@ fn read_log_entries(date: String, error_only: bool) -> Result<LogEntriesResult, 
     })
 }
 
+/// 按筛选条件分页读取日志（日志查看页专用，DEV-122550）。
+///
+/// 取代前端「全量拉取 + 内存过滤 + 全量渲染」的老路子：一台机器跑 3~15 个
+/// Chrome 实例，当天日志可达 GB 级，全量拉取会在读文件、IPC 序列化、DOM
+/// 渲染三处各卡一次。筛选与分页都在后端做，前端只拿当前这一页。
+#[tauri::command]
+fn read_log_page(date: String, query: log_file::LogQuery) -> Result<log_file::LogPage, String> {
+    log_file::read_log_page_from_dir(&get_log_dir(), &date, &query)
+}
+
 /// 刷新所有 Chrome 浏览器标签页
 /// macOS 使用 AppleScript，Windows 使用 PowerShell
 /// Chrome 未运行时不报错，直接返回跳过消息
@@ -1139,6 +1149,7 @@ pub fn run() {
             log_self_update_info,
             list_log_dates,
             read_log_entries,
+            read_log_page,
             get_system_snapshot,
             open_plugin_sidepanel,
             restart_chrome_and_open_sidepanel,

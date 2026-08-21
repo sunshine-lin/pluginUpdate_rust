@@ -651,6 +651,36 @@
   font-size: 13px;
 }
 
+/* 分页页脚：显示已加载/总条数，并在还有剩余时提供「加载更多」 */
+.log-page-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px;
+  border-top: 1px solid #eee;
+  background: #fff;
+}
+
+.log-page-count {
+  font-size: 12px;
+  color: #888;
+}
+
+.log-load-more {
+  padding: 4px 14px;
+  font-size: 12px;
+  color: #333;
+  background: #f5f5f7;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.log-load-more:hover {
+  background: #ebebef;
+}
+
 .log-table {
   width: 100%;
   border-collapse: collapse;

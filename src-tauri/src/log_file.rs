@@ -187,6 +187,140 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// 日志查询条件（筛选 + 分页）。
+///
+/// # 为什么筛选必须下推到后端
+/// 一台采购机器会跑 3~15 个 Chrome 实例，全部实例的日志灌进同一个文件。
+/// 原实现把当天全部条目读进内存、整体 IPC 传给前端、前端再过滤并全量渲染
+/// DOM——15 倍日志量下三层各自都是瓶颈（读 GB 级文本、序列化百万对象、
+/// 渲染几十万节点），点开日志页必然卡死。
+///
+/// 分页放前端做不行：日志页的用途是排查问题，筛选必须覆盖当天全部数据，
+/// 只在「前端已拿到的那一页」里筛等于筛不到。故筛选与分页都下推到这里，
+/// 在 parse 阶段就把不命中的丢掉，只把命中的那一页返回。
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogQuery {
+    /// 只读异常（ERROR/WARN）文件
+    #[serde(default)]
+    pub error_only: bool,
+    /// 级别白名单，空表示不限
+    #[serde(default)]
+    pub levels: Vec<String>,
+    /// 插件名白名单，空表示不限
+    #[serde(default)]
+    pub plugin_names: Vec<String>,
+    /// 关键词，大小写不敏感。匹配范围沿用原前端行为：消息 + 来源 + 级别 +
+    /// 插件名拼接后整体包含匹配（不只匹配消息），空表示不限
+    #[serde(default)]
+    pub keyword: String,
+    /// 起始时间，`HH:MM` 形式（沿用原前端筛选控件的粒度），空表示不限
+    #[serde(default)]
+    pub start_time: String,
+    /// 结束时间，`HH:MM` 形式，空表示不限
+    #[serde(default)]
+    pub end_time: String,
+    /// 跳过的命中条数
+    #[serde(default)]
+    pub offset: usize,
+    /// 本页最多返回的条数。0 视为使用默认值，避免前端漏传导致退回全量读取
+    #[serde(default)]
+    pub limit: usize,
+}
+
+/// 单页返回条数上限的默认值。取 500 是因为日志表格一屏撑不过百行，
+/// 500 条已足够翻阅，再多只是白付序列化与渲染成本
+pub const DEFAULT_PAGE_LIMIT: usize = 500;
+
+/// 单页返回条数的硬上限。前端传再大也截断到此值——放开上限等于允许
+/// 退回「一次性全量返回」，本次改动要解决的正是那个问题
+pub const MAX_PAGE_LIMIT: usize = 2000;
+
+/// 分页查询结果
+#[derive(Debug, serde::Serialize)]
+pub struct LogPage {
+    /// 本页条目
+    pub entries: Vec<LogEntry>,
+    /// 命中筛选条件的总条数（不受分页限制），供前端显示「共 X 条」
+    pub total: usize,
+    /// 当天出现过的全部插件名（不受筛选影响，供筛选下拉框列选项）
+    pub plugin_names: Vec<String>,
+}
+
+/// 从时间戳里取出 `HH:MM`，供时间段筛选比较。
+///
+/// 时间戳可能是 `YYYY-MM-DD HH:MM:SS.mmm`，也可能是历史遗留的其它形态，
+/// 故按「第一个 HH:MM 模式」提取而非按固定下标切——与原前端正则同口径。
+fn extract_hour_minute(timestamp: &str) -> Option<String> {
+    let bytes = timestamp.as_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2] == b':'
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4].is_ascii_digit()
+        {
+            return Some(timestamp[i..i + 5].to_string());
+        }
+    }
+    None
+}
+
+/// 判断单条日志是否命中筛选条件（不含分页）。
+///
+/// 筛选语义与改造前的前端过滤保持一致，避免用户感到「筛选行为变了」：
+/// 级别与插件名是白名单、关键词匹配「消息+来源+级别+插件名」拼接串、
+/// 时间段按 `HH:MM` 粒度比较（定宽零填充，字典序即时间序）。
+pub fn entry_matches(entry: &LogEntry, q: &LogQuery) -> bool {
+    // 级别比较统一转大写：文件里可能是 error/ERROR 混用
+    if !q.levels.is_empty()
+        && !q
+            .levels
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(&entry.level))
+    {
+        return false;
+    }
+    if !q.plugin_names.is_empty() && !q.plugin_names.iter().any(|p| p == &entry.plugin_name) {
+        return false;
+    }
+    if !q.keyword.trim().is_empty() {
+        // 大小写不敏感：排查时不该因为大小写记错而搜不到
+        let hay = format!(
+            "{}{}{}{}",
+            entry.message, entry.source, entry.level, entry.plugin_name
+        )
+        .to_lowercase();
+        if !hay.contains(&q.keyword.trim().to_lowercase()) {
+            return false;
+        }
+    }
+    if !q.start_time.is_empty() || !q.end_time.is_empty() {
+        // 取不到 HH:MM 的条目在设了时间段时一律不命中——宁可少给，
+        // 也不要把无法判定时间的条目混进用户指定的时间窗里
+        let hm = match extract_hour_minute(&entry.timestamp) {
+            Some(v) => v,
+            None => return false,
+        };
+        if !q.start_time.is_empty() && hm.as_str() < q.start_time.as_str() {
+            return false;
+        }
+        if !q.end_time.is_empty() && hm.as_str() > q.end_time.as_str() {
+            return false;
+        }
+    }
+    true
+}
+
+/// 把 limit 归一到有效区间：0（前端漏传）取默认值，超上限截断
+pub fn normalize_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_PAGE_LIMIT
+    } else {
+        limit.min(MAX_PAGE_LIMIT)
+    }
+}
+
 /// 解析一行日志。新格式（新增插件名字段后）：
 /// `[时间戳] [级别] [来源] [插件名] 消息`；旧格式（历史遗留，日志只保留 7 天，
 /// 迁移窗口期很短）：`[时间戳] [级别] [来源] 消息`，插件名回落 "unknown"。
@@ -275,6 +409,77 @@ pub fn read_log_entries_from_dir(
     }
 
     Ok(entries)
+}
+
+/// 按筛选条件分页读取日志。
+///
+/// # 与 `read_log_entries_from_dir` 的区别
+/// 后者把整天日志全读进 `Vec` 再返回，15 实例场景下会读出 GB 级文本。
+/// 本函数**逐行流式处理**：每行 parse 后立即判定是否命中，不命中就丢弃，
+/// 命中的也只在落在当前页区间时才留下。内存占用与「当页条数」成正比，
+/// 与当天日志总量无关。
+///
+/// 为拿到 `total` 仍需扫完全部行（否则前端无法显示「共 X 条」、也无法
+/// 知道有没有下一页），但扫描过程不累积数据，代价只是 IO 与 parse。
+///
+/// 插件名列表由**全部行**统计而来、不受筛选影响——否则按插件名筛过一次后，
+/// 下拉框里就只剩当前选中的那个，用户无法再切回其它插件。
+pub fn read_log_page_from_dir(dir: &Path, date: &str, q: &LogQuery) -> Result<LogPage, String> {
+    use std::io::{BufRead, BufReader};
+
+    let base_name = if q.error_only {
+        build_error_log_filename(date)
+    } else {
+        build_log_filename(date)
+    };
+
+    let limit = normalize_limit(q.limit);
+    let mut entries = Vec::new();
+    let mut total = 0usize;
+    let mut plugin_names = std::collections::BTreeSet::new();
+
+    // 主文件 + 切分文件（.1 .2 ...）依次读取，遇到不存在的序号即停止
+    let mut candidates = vec![dir.join(&base_name)];
+    for idx in 1..u32::MAX {
+        let rotated = dir.join(build_rotated_filename(&base_name, idx));
+        if !rotated.exists() {
+            break;
+        }
+        candidates.push(rotated);
+    }
+
+    for path in candidates {
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue, // 文件不存在或读取失败：跳过而非整体报错
+        };
+        for line in BufReader::new(file).lines() {
+            // 单行读取失败（如非 UTF-8 字节）跳过该行，不中断整体读取
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let entry = match parse_log_line(&line) {
+                Some(e) => e,
+                None => continue,
+            };
+            plugin_names.insert(entry.plugin_name.clone());
+            if !entry_matches(&entry, q) {
+                continue;
+            }
+            // 命中计数照常累加，但只有落在当前页区间内的才真正留下
+            if total >= q.offset && entries.len() < limit {
+                entries.push(entry);
+            }
+            total += 1;
+        }
+    }
+
+    Ok(LogPage {
+        entries,
+        total,
+        plugin_names: plugin_names.into_iter().collect(),
+    })
 }
 
 /// 从已读取的日志条目中提取去重后的插件名列表，按字母排序，
@@ -560,6 +765,297 @@ mod tests {
             vec!["2026-07-29", "2026-07-28", "2026-07-27"],
             "日期应去重（全量+异常同日只出现一次）且按最新优先排序，否则前端下拉框日期错乱或重复"
         );
+    }
+
+    /// 造一份含 n 条、插件名/级别交替的日志文件，用于分页与筛选测试
+    fn write_sample_log(dir: &Path, date: &str, n: usize) {
+        let mut content = String::new();
+        for i in 0..n {
+            let level = if i % 3 == 0 { "ERROR" } else { "INFO" };
+            let plugin = if i % 2 == 0 { "robot-01" } else { "robot-02" };
+            content.push_str(&format!(
+                "[{} {:02}:{:02}:00.000] [{}] [background] [{}] 第{}条消息\n",
+                date,
+                i / 60,
+                i % 60,
+                level,
+                plugin,
+                i
+            ));
+        }
+        fs::write(dir.join(build_log_filename(date)), content).expect("写入样例日志失败");
+    }
+
+    #[test]
+    fn test_read_log_page_limits_returned_entries() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 1000);
+
+        let q = LogQuery {
+            limit: 100,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(
+            page.entries.len(),
+            100,
+            "必须只返回一页的条数——一次性返回全量正是日志页卡顿的根因"
+        );
+        assert_eq!(
+            page.total, 1000,
+            "total 必须是命中筛选的全部条数，否则前端无法显示共多少条、也不知道有没有下一页"
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_offset_skips_earlier_entries() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 100);
+
+        let q = LogQuery {
+            offset: 10,
+            limit: 5,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(page.entries.len(), 5);
+        assert!(
+            page.entries[0].message.contains("第10条"),
+            "offset=10 应从第 11 条开始，实际: {}",
+            page.entries[0].message
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_zero_limit_falls_back_to_default() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 1000);
+
+        // 前端漏传 limit 时不能退回「全量返回」——那正是要修的问题
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &LogQuery::default())
+            .expect("读取应成功");
+
+        assert_eq!(
+            page.entries.len(),
+            DEFAULT_PAGE_LIMIT,
+            "limit 缺省必须回落到默认页大小，不能变成全量返回"
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_limit_is_capped() {
+        assert_eq!(
+            normalize_limit(999_999),
+            MAX_PAGE_LIMIT,
+            "超大 limit 必须被截断，否则前端传个极大值就等于绕过分页"
+        );
+        assert_eq!(normalize_limit(0), DEFAULT_PAGE_LIMIT);
+        assert_eq!(normalize_limit(50), 50);
+    }
+
+    #[test]
+    fn test_read_log_page_filters_by_level_before_paging() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 300);
+
+        let q = LogQuery {
+            levels: vec!["ERROR".into()],
+            limit: 1000,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(page.total, 100, "300 条里每 3 条一个 ERROR，应命中 100 条");
+        assert!(
+            page.entries.iter().all(|e| e.level == "ERROR"),
+            "筛选必须在后端生效，不能把不命中的条目返回给前端再过滤"
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_filters_by_plugin_name() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 100);
+
+        let q = LogQuery {
+            plugin_names: vec!["robot-02".into()],
+            limit: 1000,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(page.total, 50);
+        assert!(page.entries.iter().all(|e| e.plugin_name == "robot-02"));
+    }
+
+    #[test]
+    fn test_read_log_page_keyword_is_case_insensitive() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        fs::write(
+            dir.join(build_log_filename("2026-08-21")),
+            "[2026-08-21 10:00:00.000] [INFO] [background] [robot-01] Timeout occurred\n\
+             [2026-08-21 10:00:01.000] [INFO] [background] [robot-01] 一切正常\n",
+        )
+        .expect("写入失败");
+
+        let q = LogQuery {
+            keyword: "TIMEOUT".into(),
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(dir, "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(
+            page.total, 1,
+            "关键词应大小写不敏感——排查时不该因为大小写记错而搜不到"
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_filters_by_time_range() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 180);
+
+        // 时间段沿用原前端控件的 HH:MM 粒度
+        let q = LogQuery {
+            start_time: "01:00".into(),
+            end_time: "01:59".into(),
+            limit: 1000,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(page.total, 60, "应只命中 01 时段的 60 条");
+        assert!(page
+            .entries
+            .iter()
+            .all(|e| e.timestamp.starts_with("2026-08-21 01:")));
+    }
+
+    #[test]
+    fn test_read_log_page_keyword_also_matches_source_and_plugin() {
+        // 关键词匹配范围必须与改造前的前端过滤一致（消息+来源+级别+插件名），
+        // 否则用户会觉得「搜索行为变了」
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        fs::write(
+            dir.join(build_log_filename("2026-08-21")),
+            "[2026-08-21 10:00:00.000] [INFO] [sidepanel] [robot-01] 无关内容\n\
+             [2026-08-21 10:00:01.000] [INFO] [background] [robot-02] 无关内容\n",
+        )
+        .expect("写入失败");
+
+        let q = LogQuery {
+            keyword: "sidepanel".into(),
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(dir, "2026-08-21", &q).expect("读取应成功");
+        assert_eq!(page.total, 1, "关键词应能匹配到来源字段，而非只匹配消息");
+
+        let q2 = LogQuery {
+            keyword: "robot-02".into(),
+            ..Default::default()
+        };
+        let page2 = read_log_page_from_dir(dir, "2026-08-21", &q2).expect("读取应成功");
+        assert_eq!(page2.total, 1, "关键词应能匹配到插件名");
+    }
+
+    #[test]
+    fn test_read_log_page_level_filter_is_case_insensitive() {
+        // 日志文件里级别可能大小写混用，筛选不该因此漏掉条目
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        fs::write(
+            dir.join(build_log_filename("2026-08-21")),
+            "[2026-08-21 10:00:00.000] [error] [background] [robot-01] 小写级别\n\
+             [2026-08-21 10:00:01.000] [ERROR] [background] [robot-01] 大写级别\n",
+        )
+        .expect("写入失败");
+
+        let q = LogQuery {
+            levels: vec!["ERROR".into()],
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(dir, "2026-08-21", &q).expect("读取应成功");
+        assert_eq!(page.total, 2, "级别筛选应大小写不敏感");
+    }
+
+    #[test]
+    fn test_read_log_page_plugin_names_not_narrowed_by_filter() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        write_sample_log(tmp.path(), "2026-08-21", 100);
+
+        let q = LogQuery {
+            plugin_names: vec!["robot-01".into()],
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(tmp.path(), "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(
+            page.plugin_names,
+            vec!["robot-01".to_string(), "robot-02".to_string()],
+            "插件名下拉选项必须来自全部日志、不受当前筛选影响，否则筛过一次就再也切不回其它插件"
+        );
+    }
+
+    #[test]
+    fn test_read_log_page_reads_rotated_files_in_order() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        let base = build_log_filename("2026-08-21");
+        fs::write(
+            dir.join(&base),
+            "[2026-08-21 10:00:00.000] [INFO] [background] [robot-01] 主文件\n",
+        )
+        .expect("写入失败");
+        fs::write(
+            dir.join(build_rotated_filename(&base, 1)),
+            "[2026-08-21 11:00:00.000] [INFO] [background] [robot-01] 切分文件\n",
+        )
+        .expect("写入失败");
+
+        let page = read_log_page_from_dir(dir, "2026-08-21", &LogQuery::default())
+            .expect("读取应成功");
+
+        assert_eq!(page.total, 2, "切分文件必须一并读取，否则会漏掉当天后半段日志");
+        assert!(page.entries[0].message.contains("主文件"));
+        assert!(page.entries[1].message.contains("切分文件"));
+    }
+
+    #[test]
+    fn test_read_log_page_missing_file_returns_empty_not_error() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let page = read_log_page_from_dir(tmp.path(), "2099-01-01", &LogQuery::default())
+            .expect("文件不存在时应返回空页而非报错");
+        assert!(page.entries.is_empty());
+        assert_eq!(page.total, 0);
+    }
+
+    #[test]
+    fn test_read_log_page_error_only_reads_error_file() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        fs::write(
+            dir.join(build_log_filename("2026-08-21")),
+            "[2026-08-21 10:00:00.000] [INFO] [background] [robot-01] 正常\n",
+        )
+        .expect("写入失败");
+        fs::write(
+            dir.join(build_error_log_filename("2026-08-21")),
+            "[2026-08-21 10:00:01.000] [ERROR] [content] [robot-01] 出错了\n",
+        )
+        .expect("写入失败");
+
+        let q = LogQuery {
+            error_only: true,
+            ..Default::default()
+        };
+        let page = read_log_page_from_dir(dir, "2026-08-21", &q).expect("读取应成功");
+
+        assert_eq!(page.total, 1, "error_only 应只读异常文件");
+        assert_eq!(page.entries[0].message, "出错了");
     }
 
     #[test]
