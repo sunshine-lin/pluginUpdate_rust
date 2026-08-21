@@ -352,17 +352,30 @@
   padding: 24px 0;
 }
 
-/* 机器状态页底部操作区（手动打开侧边栏等） */
+/* 机器状态页底部操作区（手动打开侧边栏等）。
+   警示文案较长，改竖排避免与按钮挤在一行被截断 */
 .machine-status-actions {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
   margin-top: 16px;
 }
 
 .machine-status-hint {
   font-size: 12px;
   color: #888;
+}
+
+/* 抢焦点风险提示：会打断插件正在进行的输入，需醒目但不刺眼 */
+.machine-status-warn {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #b26a00;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  border-radius: 6px;
+  padding: 6px 10px;
 }
 
 .machine-status-grid {

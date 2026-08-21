@@ -753,8 +753,15 @@ fn refresh_chrome_tabs() -> Result<String, String> {
 }
 
 /// 打开 AIChat 插件侧边栏（模拟按下插件注册的 Ctrl+Shift+L 快捷键）。
-/// 供自愈流程在重启 Chrome 后把侧边栏拉起来——插件设计上要求 sidepanel
-/// 常驻打开才能处理任务，只重启进程而不开侧边栏等于没恢复
+///
+/// # ⚠️ 会抢占全局焦点，仅供人工按需触发
+/// 实现是「AppActivate 抢焦点 + SendKeys 发按键」，而焦点是**全局唯一**资源：
+/// 一台机器跑着 3~15 个 Chrome 实例，插件正通过它们往供应商聊天框输入文字。
+/// 抢焦点会打断其中正在输入的那个实例（不限于目标实例），按键可能落进聊天
+/// 输入框造成乱字符或丢字——那是发给供应商的内容被污染。
+///
+/// 故**不得**由自愈流程或任何定时任务自动调用（2026-08-21 已从巡检里摘除）。
+/// 保留此命令只为人工排查：使用者知道自己在干什么、且能确认此刻无人在输入。
 #[tauri::command]
 fn open_plugin_sidepanel() -> Result<String, String> {
     run_open_sidepanel_os()
@@ -782,12 +789,19 @@ fn spawn_heal_inspector(registry: std::sync::Arc<std::sync::Mutex<heartbeat::Hea
                     // 指令已入队，等插件下次心跳自取；这里只记录便于排查
                     log_client_info(&format!("[自愈] {} 心跳超时，已下发 reload 指令", plugin));
                 }
-                heartbeat::HealAction::OpenSidepanel => {
-                    log_client_info(&format!("[自愈] {} 侧边栏未打开，尝试拉起", plugin));
-                    if let Err(e) = run_open_sidepanel_os() {
-                        log_client_error(&format!("[自愈] {} 打开侧边栏失败: {}", plugin, e));
-                    }
+                // 侧边栏未打开：只记录，**不自动拉起**（2026-08-21 止血）。
+                // 拉起只能靠抢全局焦点 + 模拟按键，而一台机器上跑着 3~15 个
+                // Chrome 实例、插件正在往供应商聊天框输入文字——抢焦点会打断
+                // 其中正在输入的那个，按键落进输入框会污染发出去的聊天内容。
+                // 焦点是全局唯一资源，加节流也只是降低频率、不改变性质。
+                heartbeat::HealAction::SidepanelClosed => {
+                    log_client_error(&format!(
+                        "[自愈] {} 侧边栏未打开（自动拉起已停用，避免抢焦点干扰插件输入），需人工处理",
+                        plugin
+                    ));
                 }
+                // 已上报过，不重复记录——巡检每 5 秒一轮
+                heartbeat::HealAction::SidepanelClosedSilently => {}
                 // 二级自愈（重启 Chrome）暂不启用：一台机器会多开 2~3 个 Chrome
                 // 实例、各自登录不同 CJ 账号，重启会把全部实例一起干掉，正在跑的
                 // 采购任务全断——代价远大于收益。判定逻辑与执行命令均已实现并测试

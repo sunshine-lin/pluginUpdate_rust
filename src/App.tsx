@@ -478,8 +478,11 @@ function App() {
 
   /** 更新完成后自动刷新所有 Chrome 标签页 */
   /// 手动触发打开插件侧边栏。
-  /// 自愈流程（DEV-124702）会在重启 Chrome 后自动调用同一个命令；
-  /// 这里保留手动入口，供排查时确认快捷键链路是否通
+  ///
+  /// ⚠️ 会抢占全局焦点：实现是切换窗口 + 模拟 Ctrl+Shift+L 按键，而一台机器
+  /// 跑着 3~15 个 Chrome 实例、插件正往供应商聊天框输入文字——抢焦点会打断
+  /// 其中正在输入的那个，按键可能落进聊天框污染发出去的内容。
+  /// 故自愈流程已不再自动调用（2026-08-21 止血），仅保留此人工入口。
   async function handleOpenSidepanel() {
     setSidepanelHint("正在打开侧边栏…");
     try {
@@ -756,12 +759,16 @@ function App() {
           ) : (
             <p className="machine-status-loading">正在获取机器状态…</p>
           )}
-          {/* 插件侧边栏必须常驻打开才能处理任务。自愈流程会自动拉起，
-              这里保留手动入口供排查确认链路是否通 */}
+          {/* 插件侧边栏必须常驻打开才能处理任务。但拉起要抢全局焦点+模拟按键，
+              会打断正在往供应商聊天框输入文字的实例，故不再自动触发，
+              只保留手动入口并明确提示风险 */}
           <div className="machine-status-actions">
             <button className="btn-secondary" onClick={handleOpenSidepanel}>
               打开插件侧边栏
             </button>
+            <span className="machine-status-warn">
+              会切换窗口并模拟按键，可能打断插件正在进行的输入，请确认当前无任务在跑再点
+            </span>
             {sidepanelHint && (
               <span className="machine-status-hint">{sidepanelHint}</span>
             )}

@@ -90,6 +90,8 @@ pub struct PluginState {
     /// 会攒出上千条相同日志把有用信息淹掉（同类问题此前在自更新失败日志上
     /// 已治过一次）。原因变化时仍会重新记一条
     pub last_suppress_reason: Option<&'static str>,
+    /// 是否已就「侧边栏未打开」记过日志。巡检每 5 秒一轮，不去重会刷屏
+    pub sidepanel_closed_reported: bool,
 }
 
 impl PluginState {
@@ -103,6 +105,7 @@ impl PluginState {
             restart_count: 0,
             last_restart: None,
             last_suppress_reason: None,
+            sidepanel_closed_reported: false,
         }
     }
 }
@@ -121,8 +124,20 @@ pub enum HealAction {
     /// 同一抑制原因已上报过，调用方不必重复记日志。
     /// 巡检每 5 秒一轮，不去重会让一台故障机一天攒出上千条相同日志
     RestartSuppressedSilently,
-    /// 插件活着但侧边栏没开，补一次打开动作
-    OpenSidepanel,
+    /// 插件活着但侧边栏没开。
+    ///
+    /// # 为什么只上报、不自动拉起（2026-08-21 止血）
+    /// 拉起侧边栏只能靠「AppActivate 抢焦点 + SendKeys 发按键」，而**焦点是
+    /// 全局唯一资源**：一次抢焦点会打断那台机器上全部实例里正在输入的那个，
+    /// 不只是目标实例。插件正往供应商聊天框打字时被抢走焦点，按键会落进
+    /// 输入框变成乱字符、或造成输入丢字——那是往外发出去的聊天内容被污染，
+    /// 比侧边栏没开严重得多。
+    ///
+    /// 加节流/冷却都只是降低频率、不改变性质，故整条自动路径停用，
+    /// 改为只记录、等人工处理。
+    SidepanelClosed,
+    /// 侧边栏未开且已上报过，不重复记日志（同为每 5 秒一轮的去重需要）
+    SidepanelClosedSilently,
 }
 
 /// 心跳状态表。多个插件（理论上一台机器一个，但不假设唯一）各自独立计数
@@ -268,10 +283,16 @@ impl HeartbeatRegistry {
             return HealAction::IssueReload;
         }
 
-        // 插件活着但侧边栏关了：插件设计上要求 sidepanel 常驻才能处理任务
+        // 插件活着但侧边栏关了：只上报，不自动拉起（原因见 SidepanelClosed 文档）
         if !state.sidepanel_open {
-            return HealAction::OpenSidepanel;
+            if state.sidepanel_closed_reported {
+                return HealAction::SidepanelClosedSilently;
+            }
+            state.sidepanel_closed_reported = true;
+            return HealAction::SidepanelClosed;
         }
+        // 侧边栏已恢复：清除标记，下次再关掉时能重新上报一次
+        state.sidepanel_closed_reported = false;
 
         HealAction::None
     }
@@ -414,7 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn test_alive_plugin_with_closed_sidepanel_triggers_open() {
+    fn test_closed_sidepanel_is_reported_not_auto_opened() {
+        // 侧边栏未开只上报、不自动拉起：拉起要抢全局焦点+模拟按键，会打断
+        // 那台机器上正在往供应商聊天框输入文字的实例，污染发出去的内容
         let mut reg = HeartbeatRegistry::new();
         let now = Instant::now();
         reg.on_heartbeat(&req("robot-01", false, vec![]), now);
@@ -422,8 +445,49 @@ mod tests {
         let actions = reg.inspect(now);
         assert_eq!(
             actions[0].1,
-            HealAction::OpenSidepanel,
-            "插件活着但侧边栏关着时应补开——插件设计上要求 sidepanel 常驻才能处理任务"
+            HealAction::SidepanelClosed,
+            "侧边栏未开应只上报等人工处理，不得返回「去拉起」这种会抢焦点的动作"
+        );
+    }
+
+    #[test]
+    fn test_closed_sidepanel_reported_only_once() {
+        // 巡检每 5 秒一轮，同一状态若每轮都记日志，一天会攒出上千条相同内容
+        let mut reg = HeartbeatRegistry::new();
+        let t0 = Instant::now();
+        reg.on_heartbeat(&req("robot-01", false, vec![]), t0);
+
+        assert_eq!(reg.inspect(t0).swap_remove(0).1, HealAction::SidepanelClosed);
+
+        let t1 = t0 + Duration::from_secs(5);
+        reg.on_heartbeat(&req("robot-01", false, vec![]), t1);
+        assert_eq!(
+            reg.inspect(t1).swap_remove(0).1,
+            HealAction::SidepanelClosedSilently,
+            "同一状态重复出现时应静默，避免日志刷屏"
+        );
+    }
+
+    #[test]
+    fn test_closed_sidepanel_reported_again_after_recovery() {
+        // 侧边栏恢复后又关掉，应重新上报一次——否则只能在日志里看到最早那条
+        let mut reg = HeartbeatRegistry::new();
+        let t0 = Instant::now();
+        reg.on_heartbeat(&req("robot-01", false, vec![]), t0);
+        reg.inspect(t0);
+
+        // 侧边栏打开 → 标记清除
+        let t1 = t0 + Duration::from_secs(5);
+        reg.on_heartbeat(&req("robot-01", true, vec![]), t1);
+        assert_eq!(reg.inspect(t1).swap_remove(0).1, HealAction::None);
+
+        // 再次关闭 → 应重新上报
+        let t2 = t1 + Duration::from_secs(5);
+        reg.on_heartbeat(&req("robot-01", false, vec![]), t2);
+        assert_eq!(
+            reg.inspect(t2).swap_remove(0).1,
+            HealAction::SidepanelClosed,
+            "恢复后再次关闭必须重新上报，否则后续故障在日志里看不出来"
         );
     }
 
