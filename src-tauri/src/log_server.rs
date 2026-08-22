@@ -2,10 +2,14 @@
 //!
 //! 插件运行在浏览器沙箱内无法写文件，故由本服务接收其日志并转交落盘。
 //!
-//! # 安全边界
-//! **仅绑定 127.0.0.1**，不监听 0.0.0.0 —— AIChat 日志可能包含登录 token、
-//! 供应商聊天内容与采购报价，暴露到局域网的风险高于插件本身崩溃。
-//! 如需跨机器取日志（规划 Phase 3），必须同时补齐鉴权、脱敏与网段白名单。
+//! # 网络边界（2026-08-22 起改为监听局域网）
+//! 原先仅绑 127.0.0.1。领导要求「日志落盘本地 + AI 能远程调取分析」，
+//! 两条合起来只能走拉模式：开发的 Mac 与 15 台采购虚拟机同在公司局域网，
+//! 由 Mac 侧的 AI 直接连过来读（见 DEV-125123）。
+//!
+//! 日志含登录 token、供应商聊天与采购报价，故只读接口限制来源必须落在
+//! 私有网段（`is_lan_addr`）。环境封闭在公司内网，2026-08-22 与开发确认
+//! 按此程度处理、不再叠加共享密钥。
 
 use axum::{
     extract::State,
@@ -247,6 +251,122 @@ async fn handle_ws(mut socket: axum::extract::ws::WebSocket, state: AppState) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 只读查询接口（DEV-125123）：供开发 Mac 上的 AI 远程调取日志分析
+//
+// 领导要求「日志落盘本地 + AI 能直接调取」，故走拉模式：AI 从局域网连过来
+// 读，日志不出本机磁盘。接口复用已有的 LogQuery / summarize_log_dir，
+// 查询逻辑与本地 CLI、GUI 日志页完全同源。
+// ─────────────────────────────────────────────────────────────────
+
+/// 只读接口的查询参数（与 CLI 选项对齐）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteLogQuery {
+    /// 日期，缺省为今天
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    levels: Option<String>,
+    #[serde(default)]
+    plugin_names: Option<String>,
+    #[serde(default)]
+    keyword: Option<String>,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    end_time: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// 拒绝非内网来源。返回 Some 表示已拒绝，调用方直接返回该响应
+fn reject_if_not_lan(addr: std::net::SocketAddr) -> Option<axum::response::Response> {
+    if is_lan_addr(addr.ip()) {
+        return None;
+    }
+    Some((StatusCode::FORBIDDEN, "仅限内网访问").into_response())
+}
+
+/// 列出有日志的日期（探活用：查不到数据时先确认日期对不对）
+async fn api_log_dates(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> axum::response::Response {
+    if let Some(rejected) = reject_if_not_lan(addr) {
+        return rejected;
+    }
+    let dir = crate::get_log_dir_public();
+    Json(serde_json::json!({
+        "machineName": crate::get_reported_machine_name(),
+        "dates": crate::log_file::list_log_dates_in_dir(&dir),
+        "retainDays": crate::log_file::RETAIN_DAYS,
+    }))
+    .into_response()
+}
+
+/// 聚合概览：各级别数量、各实例异常排名、归并后的错误类别
+async fn api_log_summary(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Query(q): axum::extract::Query<RemoteLogQuery>,
+) -> axum::response::Response {
+    if let Some(rejected) = reject_if_not_lan(addr) {
+        return rejected;
+    }
+    let date = q.date.unwrap_or_else(crate::current_date);
+    match crate::log_file::summarize_log_dir(&crate::get_log_dir_public(), &date, false) {
+        Ok(summary) => Json(serde_json::json!({
+            "machineName": crate::get_reported_machine_name(),
+            "summary": summary,
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({ "error": e })).into_response(),
+    }
+}
+
+/// 明细查询（分页 + 筛选）
+async fn api_log_entries(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Query(q): axum::extract::Query<RemoteLogQuery>,
+) -> axum::response::Response {
+    if let Some(rejected) = reject_if_not_lan(addr) {
+        return rejected;
+    }
+    let date = q.date.clone().unwrap_or_else(crate::current_date);
+    // 逗号分隔的多值参数，与 CLI 的 --level / --plugin 同口径
+    let split = |s: Option<String>| -> Vec<String> {
+        s.map(|v| {
+            v.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let query = crate::log_file::LogQuery {
+        error_only: false,
+        levels: split(q.levels).into_iter().map(|s| s.to_uppercase()).collect(),
+        plugin_names: split(q.plugin_names),
+        keyword: q.keyword.unwrap_or_default(),
+        start_time: q.start_time.unwrap_or_default(),
+        end_time: q.end_time.unwrap_or_default(),
+        offset: q.offset.unwrap_or(0),
+        limit: q.limit.unwrap_or(0),
+    };
+    match crate::log_file::read_log_page_from_dir(&crate::get_log_dir_public(), &date, &query) {
+        Ok(page) => Json(serde_json::json!({
+            "machineName": crate::get_reported_machine_name(),
+            "date": date,
+            "entries": page.entries,
+            "total": page.total,
+            "pluginNames": page.plugin_names,
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({ "error": e })).into_response(),
+    }
+}
+
 fn build_router(
     sink: Arc<dyn LogSink>,
     version: &str,
@@ -258,6 +378,10 @@ fn build_router(
         .route("/log", post(ingest_log))
         .route("/heartbeat", post(ingest_heartbeat))
         .route("/ws", get(ws_upgrade))
+        // 只读查询：供开发 Mac 上的 AI 远程调取（DEV-125123）
+        .route("/api/log-dates", get(api_log_dates))
+        .route("/api/log-summary", get(api_log_summary))
+        .route("/api/log-entries", get(api_log_entries))
         .layer(build_cors_layer())
         .with_state(AppState {
             sink,
@@ -309,7 +433,7 @@ pub fn spawn(
     heartbeats: Arc<Mutex<HeartbeatRegistry>>,
     ws_token: String,
 ) -> Result<u16, String> {
-    let listener = bind_loopback()?;
+    let listener = bind_listener()?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("读取监听地址失败: {}", e))?
@@ -339,7 +463,14 @@ pub fn spawn(
                 }
             };
             if let Err(e) =
-                axum::serve(listener, build_router(sink, &version, heartbeats, ws_token)).await
+                axum::serve(
+                    listener,
+                    build_router(sink, &version, heartbeats, ws_token)
+                        // ConnectInfo 需要这个包装才能在 handler 里取到来源地址，
+                        // 只读接口靠它做内网网段判断
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
             {
                 eprintln!("日志服务异常退出: {}", e);
             }
@@ -350,11 +481,22 @@ pub fn spawn(
 }
 
 /// 从 DEFAULT_PORT 起探测可用端口，仅绑定回环地址
-fn bind_loopback() -> Result<std::net::TcpListener, String> {
+/// 绑定监听地址。
+///
+/// # 为什么改成监听局域网（DEV-125123，2026-08-22）
+/// 领导要求「日志直接落盘在本地」，同时希望 AI 能远程调取分析。两条合起来
+/// 只能是拉模式：开发的 Mac 与 15 台采购虚拟机同在公司局域网，由 Mac 侧的
+/// AI 直接连过来读。仅绑 127.0.0.1 的话跨机器根本连不上。
+///
+/// 原先坚持只绑回环是因为日志含登录 token、供应商聊天与采购报价。改为监听
+/// 局域网后这层物理隔离没有了，取而代之的是**内网网段限制**（见
+/// `is_lan_addr`）——2026-08-22 与开发确认：环境封闭在公司内网，
+/// 按功能实现优先处理。
+fn bind_listener() -> Result<std::net::TcpListener, String> {
     for offset in 0..MAX_PORT_PROBE {
         let port = DEFAULT_PORT + offset;
-        // 显式使用 127.0.0.1 而非 0.0.0.0：见模块头部安全说明
-        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+        // 0.0.0.0：同时接受本机（插件走 127.0.0.1）与局域网（AI 远程查询）
+        if let Ok(l) = std::net::TcpListener::bind(("0.0.0.0", port)) {
             return Ok(l);
         }
     }
@@ -363,6 +505,23 @@ fn bind_loopback() -> Result<std::net::TcpListener, String> {
         DEFAULT_PORT,
         DEFAULT_PORT + MAX_PORT_PROBE - 1
     ))
+}
+
+/// 判断来源地址是否属于本机或内网私有网段。
+///
+/// 只读接口据此放行——日志含供应商聊天与采购报价，不该被公司网络之外的
+/// 地址读到。覆盖 RFC1918 三段私有地址 + 回环。
+pub fn is_lan_addr(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local()
+        }
+        // IPv6 只放行回环与唯一本地地址（fc00::/7）
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 #[cfg(test)]
@@ -395,12 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_loopback_returns_listener_on_local_address() {
-        let listener = bind_loopback().expect("绑定回环地址失败，日志服务无法启动");
+    fn test_bind_listener_uses_expected_port_range() {
+        let listener = bind_listener().expect("绑定失败，日志服务无法启动");
         let addr = listener.local_addr().expect("读取地址失败");
+        // 2026-08-22 起监听 0.0.0.0：原先只绑回环，跨机器根本连不上，
+        // 而领导要求「日志落盘本地 + AI 远程调取」只能走拉模式（DEV-125123）。
+        // 读取侧的边界改由 is_lan_addr 把关，见下面的用例
         assert!(
-            addr.ip().is_loopback(),
-            "日志服务必须绑定回环地址；绑定 0.0.0.0 会将含 token 的日志暴露到局域网"
+            addr.ip().is_unspecified() || addr.ip().is_loopback(),
+            "应监听 0.0.0.0 以便局域网内的 AI 访问，实际: {}",
+            addr.ip()
         );
         assert!(
             addr.port() >= DEFAULT_PORT && addr.port() < DEFAULT_PORT + MAX_PORT_PROBE,
@@ -409,13 +572,38 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_loopback_probes_next_port_when_occupied() {
+    fn test_is_lan_addr_accepts_private_and_loopback() {
+        use std::net::IpAddr;
+        for ip in ["127.0.0.1", "192.168.7.208", "10.0.0.5", "172.16.3.9"] {
+            assert!(
+                is_lan_addr(ip.parse::<IpAddr>().expect("解析失败")),
+                "{} 属于本机或内网，应放行",
+                ip
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_lan_addr_rejects_public() {
+        use std::net::IpAddr;
+        // 日志含供应商聊天与采购报价，不该被公司网络之外的地址读到
+        for ip in ["8.8.8.8", "1.1.1.1", "203.0.113.7"] {
+            assert!(
+                !is_lan_addr(ip.parse::<IpAddr>().expect("解析失败")),
+                "{} 是公网地址，必须拒绝",
+                ip
+            );
+        }
+    }
+
+    #[test]
+    fn test_bind_listener_probes_next_port_when_occupied() {
         let first = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT));
         // 若首端口本就被外部占用则跳过，避免误报
         if first.is_err() {
             return;
         }
-        let second = bind_loopback().expect("首端口被占用时应探测到下一个可用端口");
+        let second = bind_listener().expect("首端口被占用时应探测到下一个可用端口");
         assert_ne!(
             second.local_addr().expect("读取地址失败").port(),
             DEFAULT_PORT,

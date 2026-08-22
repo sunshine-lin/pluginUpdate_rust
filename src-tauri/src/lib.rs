@@ -265,6 +265,39 @@ pub fn get_machine_id() -> String {
     )
 }
 
+/// 供 log_server 的只读接口使用的日志目录（`get_log_dir` 是私有的）
+pub fn get_log_dir_public() -> PathBuf {
+    get_log_dir()
+}
+
+/// 今天的日期（北京时间），格式 YYYY-MM-DD
+pub fn current_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// 本机对外自报的机器名（DEV-125123）。
+///
+/// # 为什么用插件上报的名字而不是主机名
+/// 开发实际是按「10-2-cj055514」这类编号找机器的——那是插件的下载目录名
+/// （见 pms-aichat 的 pluginIdentity），每台机器不同且稳定，团队本来就用它
+/// 指代机器。用自动生成的 machine_id 或系统主机名，查日志时还得多一层映射。
+///
+/// 取值来自心跳注册表里最近上报过的插件名。取不到（插件还没上报过）时
+/// 回落 machine_id，保证这个字段永远有值——AI 靠它确认「连对机器了吗」。
+pub fn get_reported_machine_name() -> String {
+    if let Some(reg) = HEARTBEATS.get() {
+        if let Ok(guard) = reg.lock() {
+            // 多实例时取最近活跃的那个：它们同属一台机器，名字前缀相同，
+            // 拿哪个都能标识这台机器
+            let snaps = guard.snapshots(std::time::Instant::now());
+            if let Some(first) = snaps.iter().min_by_key(|s| s.silence_secs) {
+                return first.plugin_name.clone();
+            }
+        }
+    }
+    get_machine_id()
+}
+
 // ─────────────────────────────────────────────────────────────────
 // 日志格式化纯函数（Task 1.2/1.3，可测试）
 // ─────────────────────────────────────────────────────────────────
