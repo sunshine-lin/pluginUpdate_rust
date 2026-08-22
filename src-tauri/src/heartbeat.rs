@@ -402,7 +402,19 @@ impl HeartbeatRegistry {
         // 已脱离二级区间：清除抑制记录，下次真的失联时能重新上报
         state.last_suppress_reason = None;
 
-        // 一级：疑似半死，下发 reload 让插件自己重载
+        // 一级：疑似半死，下发 reload 让插件自己重载。
+        //
+        // # 为什么这里不判 sidepanel_open
+        // reload 会连带销毁侧边栏、而侧边栏无法由代码重开，故插件侧加了
+        // 「侧边栏还开着就拒绝执行 reload」的守卫。判断放在**插件侧**而非
+        // 这里，是因为触发本分支的前提正是「心跳已超时」——此时手上的
+        // sidepanel_open 是至少 20 秒前的旧值，据它决策等于拿过期数据下判断。
+        // 插件真收到指令时在本地复检一次才准。
+        //
+        // # ack 对 reload 无效
+        // 插件执行 reload 会销毁自己的 Service Worker，连带销毁待 ack 队列，
+        // 那条 cmd id 永远发不回来。故防重复完全依赖下面的 reload_issued 标志，
+        // 不能指望 ack 出队（新增重启型指令时同理）。
         if silence >= RELOAD_THRESHOLD {
             if state.reload_issued {
                 return HealAction::None;
