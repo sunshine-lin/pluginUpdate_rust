@@ -27,11 +27,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 足够抵御在线暴力猜测（本服务只监听 127.0.0.1，无远程爆破面）
 const TOKEN_HEX_LEN: usize = 32;
 
+/// 进程内调用计数，保证同一进程内多次生成必不相同。
+///
+/// 只靠时间戳 + pid + 栈地址不够：同一进程内连续两次调用，pid 与栈地址完全
+/// 相同，而纳秒时间戳在部分平台的实际精度远低于纳秒（macOS 上实测同一
+/// 微秒内的两次调用会拿到相同值），于是生成出**一模一样的令牌**。
+/// 这不是理论问题——加上这个计数器之前，`generate_token()` 连续调用两次
+/// 就会返回同一个串（有测试守着）。
+static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 生成一个随机令牌。
 ///
-/// 用「时间戳 + 进程 id + 地址熵」混合而非引入 rand 依赖：本令牌只需
-/// 「同一台机器上的其它网页脚本猜不到」，不用于加密。混合三个源是因为
-/// 单用时间戳会被同一毫秒内启动的进程撞上，也容易被猜。
+/// 用「时间戳 + 进程 id + 栈地址 + 进程内计数」混合而非引入 rand 依赖：
+/// 本令牌只需「同一台机器上的其它网页脚本猜不到」，不用于加密。
 pub fn generate_token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -40,9 +48,10 @@ pub fn generate_token() -> String {
     let pid = std::process::id() as u128;
     // 取一个栈变量地址作为第三个熵源（ASLR 下每次运行不同）
     let stack_marker = &nanos as *const u128 as u128;
+    // 进程内单调递增，保证同进程多次调用必不相同
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
 
-    // 三段混合后取 hex，做一次简单扩散避免高位全是固定前缀
-    let mut acc = nanos ^ (pid << 64) ^ stack_marker;
+    let mut acc = nanos ^ (pid << 64) ^ stack_marker ^ (seq << 96) ^ seq.wrapping_mul(0x9E37_79B9);
     let mut out = String::with_capacity(TOKEN_HEX_LEN);
     while out.len() < TOKEN_HEX_LEN {
         // xorshift 风格扩散：让每一轮输出都依赖全部输入位
@@ -101,10 +110,21 @@ mod tests {
 
     #[test]
     fn test_generated_tokens_differ_between_calls() {
-        // 每次客户端启动都应拿到不同令牌——固定令牌等于没有令牌
+        // 每次客户端启动都应拿到不同令牌——固定令牌等于没有令牌。
+        // 曾真实失败过：只靠时间戳+pid+栈地址时，同一进程内连续两次调用
+        // （pid 与栈地址相同、时间戳精度不足）会返回一模一样的串
         let a = generate_token();
         let b = generate_token();
         assert_ne!(a, b, "两次生成的令牌不应相同，否则可被预测");
+    }
+
+    #[test]
+    fn test_many_generated_tokens_are_all_distinct() {
+        // 连续快速生成也不得碰撞——单次比较可能碰巧通过
+        let n = 200;
+        let set: std::collections::HashSet<String> =
+            (0..n).map(|_| generate_token()).collect();
+        assert_eq!(set.len(), n, "{} 次生成出现重复令牌", n - set.len());
     }
 
     #[test]

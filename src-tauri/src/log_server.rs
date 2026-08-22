@@ -10,6 +10,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -44,6 +45,7 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     ok: bool,
     /// 客户端版本，供插件判断兼容性。
@@ -53,6 +55,23 @@ struct HealthResponse {
     /// `CARGO_PKG_VERSION`——后者是 Cargo.toml 的版本，两者不同步时会出现
     /// 「程序实际跑新版、对外自报旧版」，排查时被自己的日志误导。
     version: String,
+    /// WS 握手令牌（DEV-125034）。
+    ///
+    /// # 为什么由 /health 下发，而不是写文件让插件读
+    /// 插件在浏览器沙箱里读不到任意本地文件。而 `/health` 是既有端点、
+    /// 插件本来就用它探活，顺带取令牌不增加任何链路。
+    ///
+    /// # 这样是否等于没有鉴权
+    /// **不等于，但要说清边界**：任意网页脚本确实也能 GET /health 拿到令牌
+    /// （CORS 放开了任意来源）。令牌真正挡住的是「**不知道客户端在哪/没探测过**
+    /// 就直接连 WS」的情况，以及把攻击面从「任意页面随手连上」压到「必须先
+    /// 成功探测本机端口」。
+    ///
+    /// 真正的隔离依赖两件事：仅绑 127.0.0.1（局域网到不了）、令牌每次启动
+    /// 重新生成（不持久化、泄露仅限单次运行）。要做到「只有真插件能连」，
+    /// 需把令牌改为写入插件安装目录（网页脚本读不到扩展的私有文件）——
+    /// 那是下一步，本轮先保证通道本身可用且有校验位。
+    ws_token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,12 +102,15 @@ struct AppState {
     /// 插件心跳状态表。跨请求共享且需可变，故用 Mutex 包裹——
     /// 心跳每 5 秒一次、指令队列极短，锁竞争可忽略
     heartbeats: Arc<Mutex<HeartbeatRegistry>>,
+    /// WS 握手令牌。每次客户端启动重新生成、不持久化
+    ws_token: String,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         version: state.version.clone(),
+        ws_token: state.ws_token.clone(),
     })
 }
 
@@ -135,20 +157,113 @@ async fn ingest_heartbeat(
     (StatusCode::OK, Json(resp))
 }
 
+// ─────────────────────────────────────────────────────────────────
+// WebSocket 通道（DEV-125034/125035）
+//
+// # 相比 HTTP 轮询的收益
+// - 客户端可**主动推**指令，不必等插件下次来问（原先最多延迟 5 秒）
+// - 连接断开是即时事件，不必靠超时推算
+// - 15 实例每秒 3 次 HTTP 请求的开销归零
+//
+// # 为什么仍然保留 last_seen + 阈值判定
+// 没有直接用「连接断开 = 失联」：MV3 Service Worker 有 30 秒空闲销毁机制，
+// 且 AI1-5422 实测过「窗口不在前台时 WS 被节流」。连接断开可能只是 SW 被
+// 回收（插件其实是好的），立刻判失联会误报。故沿用原有阈值语义，
+// WS 只替换传输层——这也让两种通道可以并存过渡。
+//
+// # 安全
+// WS **不受同源策略限制**（没有预检、浏览器也不会因跨域拦截），任意网页脚本
+// 都能连 ws://127.0.0.1:17653。故必须校验握手令牌，否则 1688 页面上的脚本
+// 可以伪装成插件上报假状态、或接收下发的指令。这也是 CLAUDE.md 那条红线
+// （「CORS 放开的前提是只写不读」）在双向通道下不再成立的直接后果。
+// ─────────────────────────────────────────────────────────────────
+
+/// WS 握手查询参数
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    /// 握手令牌，必须与客户端本次运行生成的一致
+    #[serde(default)]
+    token: String,
+}
+
+/// WS 升级入口。令牌不匹配一律拒绝，不给出「令牌错」还是「没带」的区别——
+/// 减少探测面。
+///
+/// # 提取器顺序有讲究
+/// `Query` 与 `State` 必须放在 `WebSocketUpgrade` **之前**：后者是「消耗请求
+/// 体」的提取器，一旦它先运行且请求不满足升级条件（缺 upgrade 头等），
+/// axum 会直接返回 426 Upgrade Required——**令牌检查根本跑不到**。
+/// 顺序写错的后果不是编译错误，而是鉴权被静默绕过一半（未授权者拿到 426
+/// 而非 401，看似也被拒了，但那是协议检查在拒，不是我们的鉴权在拒）。
+async fn ws_upgrade(
+    axum::extract::Query(q): axum::extract::Query<WsQuery>,
+    State(state): State<AppState>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    if !crate::ws_token::token_matches(&state.ws_token, &q.token) {
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+/// 单个 WS 连接的收发循环。
+///
+/// 协议与 HTTP 心跳完全一致（同一个 `HeartbeatRequest`/`HeartbeatResponse`），
+/// 只是换了载体——插件侧可以只改传输、不动业务逻辑。
+async fn handle_ws(mut socket: axum::extract::ws::WebSocket, state: AppState) {
+    use axum::extract::ws::Message;
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        let text = match msg {
+            Message::Text(t) => t,
+            // 心跳保活帧：axum 自动回 Pong，无需处理
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => break,
+            // 二进制帧不在协议内，忽略而非断连——协议将来可能扩展
+            Message::Binary(_) => continue,
+        };
+
+        // 解析失败不断连：一条坏消息不该让插件重连一轮，
+        // 与 HTTP 侧「对失败宽容」的口径一致
+        let req: HeartbeatRequest = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let resp = match state.heartbeats.lock() {
+            Ok(mut reg) => reg.on_heartbeat(&req, Instant::now()),
+            // 锁被毒化时退化为「本次不下发指令」，插件下次心跳仍会重试
+            Err(_) => HeartbeatResponse { commands: vec![] },
+        };
+
+        let payload = match serde_json::to_string(&resp) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // 发送失败说明对端已走，退出循环让连接自然关闭
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
 fn build_router(
     sink: Arc<dyn LogSink>,
     version: &str,
     heartbeats: Arc<Mutex<HeartbeatRegistry>>,
+    ws_token: String,
 ) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/log", post(ingest_log))
         .route("/heartbeat", post(ingest_heartbeat))
+        .route("/ws", get(ws_upgrade))
         .layer(build_cors_layer())
         .with_state(AppState {
             sink,
             version: version.to_string(),
             heartbeats,
+            ws_token,
         })
 }
 
@@ -185,10 +300,14 @@ fn build_cors_layer() -> tower_http::cors::CorsLayer {
 ///   与 updater 比对所用版本同源
 /// * `heartbeats` - 心跳状态表，由调用方持有同一实例并交给自愈巡检任务，
 ///   两边必须共享——巡检要读 HTTP 侧写入的 last_seen，也要往队列塞指令
+/// 启动本地服务。返回实际监听的端口。
+///
+/// `ws_token` 是 WS 握手令牌（每次启动新生成），插件需带上它才能建立 WS 连接
 pub fn spawn(
     sink: Arc<dyn LogSink>,
     version: &str,
     heartbeats: Arc<Mutex<HeartbeatRegistry>>,
+    ws_token: String,
 ) -> Result<u16, String> {
     let listener = bind_loopback()?;
     let port = listener
@@ -220,7 +339,7 @@ pub fn spawn(
                 }
             };
             if let Err(e) =
-                axum::serve(listener, build_router(sink, &version, heartbeats)).await
+                axum::serve(listener, build_router(sink, &version, heartbeats, ws_token)).await
             {
                 eprintln!("日志服务异常退出: {}", e);
             }
@@ -257,6 +376,7 @@ mod tests {
             sink,
             version: version.into(),
             heartbeats: Arc::new(Mutex::new(HeartbeatRegistry::new())),
+            ws_token: TEST_WS_TOKEN.to_string(),
         }
     }
 
@@ -454,6 +574,9 @@ mod tests {
     // 缺少 CORS 头时浏览器直接拦截，日志一条都收不到（实测现象）
     // ─────────────────────────────────────────────────────────
 
+    /// 测试用固定令牌。真实运行时每次启动随机生成
+    const TEST_WS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
     fn test_router() -> Router {
         let sink = Arc::new(MemSink {
             lines: Mutex::new(Vec::new()),
@@ -462,7 +585,89 @@ mod tests {
             sink as Arc<dyn LogSink>,
             "0.0.0-test",
             Arc::new(Mutex::new(HeartbeatRegistry::new())),
+            TEST_WS_TOKEN.to_string(),
         )
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // WS 握手令牌（DEV-125034）：WS 不受同源策略限制，任意网页脚本都能连
+    // ws://127.0.0.1:17653，不校验则可伪装成插件上报假状态、或收走下发的指令
+    // ─────────────────────────────────────────────────────────
+
+    /// 用真实 TCP 连接测 WS 握手。
+    ///
+    /// # 为什么不能用 `oneshot`
+    /// axum 的 `WebSocketUpgrade` 需要 `hyper::upgrade::OnUpgrade` 扩展，
+    /// 那是真实连接被 hyper 处理时才注入的。`oneshot` 直接把请求塞给 Router，
+    /// 没有这个扩展，于是**永远返回 426 Upgrade Required、令牌检查根本跑不到**
+    /// ——用它测这条路只会得到「看起来也拒了」的假象。故起真服务、真连接。
+    async fn ws_handshake_status(query: &str) -> u16 {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑定失败");
+        let port = listener.local_addr().expect("取地址失败").port();
+        let router = test_router();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        // 用裸 TCP 发握手请求：不引入 WS 客户端依赖，只看响应状态行
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("连接失败");
+        let req = format!(
+            "GET /ws{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            query, port
+        );
+        stream.write_all(req.as_bytes()).await.expect("发送失败");
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await.expect("读取失败");
+        let head = String::from_utf8_lossy(&buf[..n]);
+        // 状态行形如 "HTTP/1.1 401 Unauthorized"
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_missing_token() {
+        assert_eq!(
+            ws_handshake_status("").await,
+            401,
+            "不带令牌必须拒绝——否则 1688 页面上的任意脚本都能连上来"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_wrong_token() {
+        assert_eq!(
+            ws_handshake_status("?token=ffffffffffffffffffffffffffffffff").await,
+            401,
+            "错误令牌必须拒绝"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_accepts_valid_token() {
+        assert_eq!(
+            ws_handshake_status(&format!("?token={}", TEST_WS_TOKEN)).await,
+            101,
+            "正确令牌应完成协议升级（101 Switching Protocols）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_rejects_token_prefix() {
+        // 常量时间比较里的长度检查就是为了挡这个
+        assert_eq!(
+            ws_handshake_status("?token=0123456789abcdef").await,
+            401,
+            "正确前缀不得通过"
+        );
     }
 
     #[tokio::test]

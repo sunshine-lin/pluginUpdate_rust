@@ -721,6 +721,10 @@ static HEARTBEATS: std::sync::OnceLock<
     std::sync::Arc<std::sync::Mutex<heartbeat::HeartbeatRegistry>>,
 > = std::sync::OnceLock::new();
 
+/// 本次运行的 WS 握手令牌。插件需带上它才能建立 WS 连接——
+/// WS 不受同源策略限制，任意网页脚本都能连本机端口，故必须校验
+static WS_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// 构建客户端自身错误的日志行（可测试的纯函数部分）
 pub fn build_client_error_line(message: &str) -> String {
     format_log_line(&current_timestamp(), "error", "client", "client", message)
@@ -1413,7 +1417,10 @@ pub fn run() {
             ));
             // 供巡检看板命令读取同一份状态
             let _ = HEARTBEATS.set(heartbeats.clone());
-            match log_server::spawn(sink, &app_version, heartbeats.clone()) {
+            // WS 握手令牌：每次启动新生成、不持久化，泄露影响限于单次运行周期
+            let ws_token = ws_token::generate_token();
+            let _ = WS_TOKEN.set(ws_token.clone());
+            match log_server::spawn(sink, &app_version, heartbeats.clone(), ws_token) {
                 Ok(port) => {
                     LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
                     println!(
