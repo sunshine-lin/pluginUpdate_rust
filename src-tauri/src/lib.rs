@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
+pub mod cli;
 pub mod heartbeat;
 pub mod log_file;
 pub mod log_server;
@@ -36,6 +37,15 @@ struct PathConfig {
     /// 开机自启偏好。默认关闭：装上不改变用户开机行为，由用户在托盘菜单主动开启
     #[serde(skip_serializing_if = "Option::is_none")]
     autostart: Option<bool>,
+    /// 本机唯一标识（DEV-125123）。首次启动生成后不再变化。
+    ///
+    /// # 为什么现在就要
+    /// 现在区分实例只靠 `plugin_name`（插件自报的下载目录名）——同机多实例够用
+    /// （各实例目录不同、名字唯一），但十几台机器汇总时会撞名。规划文档把它列为
+    /// 🟠 技术卡点并注明「不管推拉都要做，越晚做历史数据越脏」：不做的话，等真
+    /// 接了集中上报再补，此前所有日志都无法归属到机器。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_id: Option<String>,
     /// 透传本结构未声明的字段。serde 默认丢弃未知字段，
     /// 若不保留会在写入任一配置项时静默抹掉其它程序写入的数据
     #[serde(flatten)]
@@ -152,6 +162,107 @@ pub fn save_autostart_to_file(config_file: &PathBuf, enabled: bool) -> Result<()
     let content = serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("序列化配置失败: {}", e))?;
     fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}
+
+/// 读取或首次生成本机标识（DEV-125123）。
+///
+/// 已有则原样返回；没有则生成并落盘。**生成后不再变化**——它的用途是把日志
+/// 归属到机器，一变就等于换了台新机器，历史数据全部对不上。
+///
+/// 形态是 `<主机名>-<随机后缀>`：只用主机名不行（虚拟机克隆出来会重名，
+/// 而采购机大概率就是克隆的），只用随机串则人看不出是哪台、排查时无从下手。
+pub fn load_or_create_machine_id(config_file: &PathBuf, hostname: &str) -> String {
+    let mut cfg: PathConfig = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        PathConfig::default()
+    };
+    if let Some(existing) = cfg.machine_id.as_ref().filter(|s| !s.is_empty()) {
+        return existing.clone();
+    }
+
+    let id = build_machine_id(hostname, &ws_token::generate_token());
+    cfg.machine_id = Some(id.clone());
+    // 写失败不影响本次运行，只是下次启动会重新生成——比因为写不了配置
+    // 就拒绝启动要好（采购机可能有权限问题）
+    if let Some(parent) = config_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&cfg) {
+        let _ = fs::write(config_file, content);
+    }
+    id
+}
+
+/// 拼装机器 ID（纯函数）。主机名做安全化处理，随机部分取前 8 位。
+///
+/// 主机名里的空格、中文、标点会让 ID 在日志行、文件名、URL 里都不好处理，
+/// 故只保留字母数字与横杠，其余替换为 `-`
+pub fn build_machine_id(hostname: &str, random_hex: &str) -> String {
+    let safe: String = hostname
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // 连续横杠压成一个，并去掉首尾横杠，避免出现 `--host---1a2b`
+    let mut host = String::new();
+    let mut prev_dash = false;
+    for c in safe.chars() {
+        if c == '-' {
+            if !prev_dash {
+                host.push(c);
+            }
+            prev_dash = true;
+        } else {
+            host.push(c);
+            prev_dash = false;
+        }
+    }
+    let host = host.trim_matches('-');
+    let host = if host.is_empty() { "unknown" } else { host };
+    // 主机名过长会让 ID 难读，截断到 32 字符
+    let host: String = host.chars().take(32).collect();
+    let suffix: String = random_hex.chars().take(8).collect();
+    format!("{}-{}", host, suffix)
+}
+
+/// 取本机主机名，取不到时回落 `unknown`
+fn current_hostname() -> String {
+    // 优先环境变量（Windows 用 COMPUTERNAME，Unix 用 HOSTNAME）
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    // 回落到 hostname 命令：Unix 上 HOSTNAME 常未导出到子进程环境
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(out) = std::process::Command::new("hostname").output() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+/// 取本机标识，供日志与查询输出携带
+pub fn get_machine_id() -> String {
+    load_or_create_machine_id(
+        &get_config_file_path_with_dir(&get_app_config_dir()),
+        &current_hostname(),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1222,8 +1333,49 @@ async fn get_system_snapshot(env: String) -> SystemSnapshot {
     build_system_snapshot(hw, &disk_infos, &install_path)
 }
 
+/// 若命令行是 CLI 查询模式则执行并返回 true，调用方据此跳过 GUI。
+///
+/// # 为什么必须在 Tauri 初始化之前判断
+/// `run()` 里注册了 single-instance 插件：常驻进程已在运行时，新进程会把
+/// 参数转发给已有实例然后自己退出——CLI 参数会被当成「唤回窗口」的请求，
+/// 查询结果永远不会打印。故这个分支必须**早于** `tauri::Builder` 返回。
+pub fn try_run_cli() -> bool {
+    let argv: Vec<String> = std::env::args().collect();
+    let first = argv.get(1).map(|s| s.as_str());
+    if first != Some(cli::QUERY_SUBCOMMAND) {
+        // 带了参数但不是已知子命令：**不能静默拉起 GUI**。
+        // 采购机上有人误传参数（或调用方用了不支持该子命令的旧版）时，
+        // 静默弹出界面既打扰用户、又让调用方一直等一个永不返回的进程。
+        // 以 `-` 开头视为想用命令行，给出用法并退出；裸参数留给 Tauri
+        // 处理（系统可能传入文件路径等）
+        if let Some(arg) = first {
+            if arg.starts_with('-') {
+                cli::attach_console_if_needed();
+                println!("{}", cli::usage_text());
+                return true;
+            }
+        }
+        return false;
+    }
+    // Windows 下 GUI 子系统的进程默认无控制台，不附加则输出写进虚空
+    cli::attach_console_if_needed();
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let req = cli::parse_args(&argv[2..], &today);
+    // 带上机器标识：将来多台机器的输出汇总到一处时，没有它无法区分来源
+    println!(
+        "{}",
+        cli::execute_with_machine(req, &get_log_dir(), &get_machine_id())
+    );
+    true
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // CLI 模式：查完即退，不拉起 GUI（须在 Tauri 初始化前，见 try_run_cli 文档）
+    if try_run_cli() {
+        return;
+    }
     tauri::Builder::default()
         // 单实例锁：常驻后重复启动只唤回已有窗口，避免多进程抢占日志端口（Task 1.2）
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1967,6 +2119,87 @@ mod tests {
             parsed.get("autostart").and_then(|v| v.as_bool()),
             Some(true),
             "配置中应存在布尔字段 autostart，字段名变动会导致旧版本配置无法识别"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 机器标识（DEV-125123）
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_machine_id_combines_host_and_random() {
+        let id = build_machine_id("WIN-BUYER01", "abcdef1234567890");
+        assert_eq!(id, "WIN-BUYER01-abcdef12", "应为 主机名-随机8位");
+    }
+
+    #[test]
+    fn test_build_machine_id_sanitizes_hostname() {
+        // 主机名里的空格/中文/标点会让 ID 在日志行、文件名、URL 里都不好处理
+        let id = build_machine_id("采购 机器.01", "abcdef1234567890");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "ID 只应含字母数字与横杠，实际: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn test_build_machine_id_collapses_dashes() {
+        // 全是非法字符的主机名不该产出 `-----1a2b` 这种 ID
+        let id = build_machine_id("中文主机", "abcdef1234567890");
+        assert!(!id.contains("--"), "不应出现连续横杠: {}", id);
+        assert!(!id.starts_with('-'), "不应以横杠开头: {}", id);
+    }
+
+    #[test]
+    fn test_build_machine_id_falls_back_when_hostname_unusable() {
+        let id = build_machine_id("...", "abcdef1234567890");
+        assert!(
+            id.starts_with("unknown-"),
+            "主机名不可用时应回落 unknown，实际: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn test_machine_id_is_stable_across_calls() {
+        // ID 的用途是把日志归属到机器，一变就等于换了台新机器、历史数据全对不上
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let cfg = dir.path().join("config.json");
+        let first = load_or_create_machine_id(&cfg, "host-a");
+        let second = load_or_create_machine_id(&cfg, "host-a");
+        assert_eq!(first, second, "同一配置文件必须返回同一个 ID");
+    }
+
+    #[test]
+    fn test_machine_id_preserves_other_config_fields() {
+        // 复用 config.json 时不得抹掉已有的安装路径等设置
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let cfg = dir.path().join("config.json");
+        save_path_to_config_file(&cfg, "online", "/Users/x/aichat").expect("写入路径失败");
+        save_autostart_to_file(&cfg, true).expect("写入自启失败");
+
+        load_or_create_machine_id(&cfg, "host-a");
+
+        assert_eq!(
+            load_saved_path_from_file(&cfg, "online").as_deref(),
+            Some("/Users/x/aichat"),
+            "生成机器 ID 不得抹掉已保存的安装路径"
+        );
+        assert!(load_autostart_from_file(&cfg), "不得抹掉自启偏好");
+    }
+
+    #[test]
+    fn test_machine_id_written_to_config_file() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let cfg = dir.path().join("config.json");
+        let id = load_or_create_machine_id(&cfg, "host-a");
+        let content = fs::read_to_string(&cfg).expect("配置应已落盘");
+        assert!(
+            content.contains(&id),
+            "机器 ID 须持久化，否则重启就变了。文件内容: {}",
+            content
         );
     }
 

@@ -198,7 +198,7 @@ pub struct LogEntry {
 /// 分页放前端做不行：日志页的用途是排查问题，筛选必须覆盖当天全部数据，
 /// 只在「前端已拿到的那一页」里筛等于筛不到。故筛选与分页都下推到这里，
 /// 在 parse 阶段就把不命中的丢掉，只把命中的那一页返回。
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogQuery {
     /// 只读异常（ERROR/WARN）文件
@@ -494,6 +494,252 @@ pub fn collect_plugin_names(entries: &[LogEntry]) -> Vec<String> {
         .collect()
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 跨实例异常聚合（DEV-125123，供 AI 排查）
+//
+// 一台机器跑 3~15 个 Chrome 实例，日志全灌进同一份文件，一天可达几十万行。
+// AI 直接读全量既慢又抓不住重点；真正能下判断的信息是「今天 ERROR 4 万条，
+// 其中 robot-07 占 3.8 万、都是同一个 pattern」——故需要先聚合再给它看。
+// ─────────────────────────────────────────────────────────────────
+
+/// 单个实例的日志计数
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginStat {
+    pub plugin_name: String,
+    /// 该实例的总条数
+    pub total: usize,
+    /// 其中 ERROR/WARN 条数——排序依据，异常多的实例排前面
+    pub errors: usize,
+}
+
+/// 一类归并后的错误
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorCluster {
+    /// 归一后的错误特征（可变部分已替换为占位符）
+    pub pattern: String,
+    pub count: usize,
+    /// 出现过该错误的实例名——**跨实例关联的关键**：
+    /// 「15 台里 3 台同时报同一个错」与「1 台报了 3 万次」是完全不同的问题
+    pub plugins: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    /// 一条未归一的原始消息，供人/AI 看具体长什么样
+    pub sample: String,
+}
+
+/// 某天日志的聚合概览
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogSummary {
+    pub date: String,
+    /// 全部条数（不受任何筛选影响）
+    pub total: usize,
+    /// 各级别条数，键为大写级别名
+    pub by_level: std::collections::BTreeMap<String, usize>,
+    /// 各实例统计，异常多的排前
+    pub by_plugin: Vec<PluginStat>,
+    /// 归并后的错误类别，按出现次数倒序
+    pub top_errors: Vec<ErrorCluster>,
+}
+
+/// `top_errors` 最多返回的类别数。取 20 是因为：聚合的用途是「一眼看出主要
+/// 矛盾」，尾部长尾对判断没帮助；条数多时应改用筛选查明细而非扩大这个数
+pub const MAX_ERROR_CLUSTERS: usize = 20;
+
+/// 把错误消息归一成「特征」，供同类归并。
+///
+/// # 为什么必须归一
+/// 「商品 12345 抓取失败」与「商品 67890 抓取失败」是同一个问题，但字面不同。
+/// 不归一就会被算成两类，几万条各不相同的消息会产出几万个「类别」，聚合完全
+/// 失去意义——这正是本函数存在的唯一理由。
+///
+/// 替换顺序有讲究：URL 必须在数字之前处理，否则 URL 里的数字会先被替换掉、
+/// 导致同一个接口的不同参数被当成不同 URL。
+pub fn normalize_error_pattern(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let bytes = message.as_bytes();
+    let mut i = 0;
+
+    while i < message.len() {
+        // URL：从 http 开始吃到空白为止，整段替换
+        if message[i..].starts_with("http://") || message[i..].starts_with("https://") {
+            out.push_str("<URL>");
+            while i < message.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        // 连续数字：2 位以上视为可变值（ID/数量/耗时）。
+        // 单个数字保留——「第 1 步」这类序号是特征本身的一部分
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < message.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start >= 2 {
+                out.push_str("<N>");
+            } else {
+                out.push_str(&message[start..i]);
+            }
+            continue;
+        }
+        // 其余字符按 UTF-8 字符边界原样保留（不能按字节推进，中文会被截断）
+        let ch = message[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 流式聚合器。
+///
+/// # 为什么不能复用 `read_log_page_from_dir` 的结果做聚合
+/// 那个函数受 `MAX_PAGE_LIMIT`（2000）约束，只返回一页。拿一页去聚合等于
+/// 用 0.5% 的样本算「哪个实例异常最多」——排名完全不可信，而输出看起来
+/// 却像正经统计，比不给更危险。
+///
+/// 聚合只累加计数与少量归并键，内存占用与「错误类别数」成正比而非日志量，
+/// 故可以放心扫全量：40 万行实测 0.2 秒级。
+#[derive(Default)]
+struct SummaryAccumulator {
+    by_level: std::collections::BTreeMap<String, usize>,
+    plugin_total: std::collections::BTreeMap<String, usize>,
+    plugin_errors: std::collections::BTreeMap<String, usize>,
+    clusters: std::collections::BTreeMap<String, ErrorCluster>,
+    total: usize,
+}
+
+impl SummaryAccumulator {
+    fn push(&mut self, e: &LogEntry) {
+        self.total += 1;
+        let level = e.level.to_uppercase();
+        *self.by_level.entry(level).or_insert(0) += 1;
+        *self.plugin_total.entry(e.plugin_name.clone()).or_insert(0) += 1;
+
+        if !crate::is_error_level(&e.level) {
+            return;
+        }
+        *self.plugin_errors.entry(e.plugin_name.clone()).or_insert(0) += 1;
+
+        let pattern = normalize_error_pattern(&e.message);
+        match self.clusters.get_mut(&pattern) {
+            Some(c) => {
+                c.count += 1;
+                if !c.plugins.contains(&e.plugin_name) {
+                    c.plugins.push(e.plugin_name.clone());
+                }
+                // 按文件顺序（即时间顺序）遍历，故后来者即更晚
+                c.last_seen = e.timestamp.clone();
+            }
+            None => {
+                self.clusters.insert(
+                    pattern.clone(),
+                    ErrorCluster {
+                        pattern,
+                        count: 1,
+                        plugins: vec![e.plugin_name.clone()],
+                        first_seen: e.timestamp.clone(),
+                        last_seen: e.timestamp.clone(),
+                        sample: e.message.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn finish(self, date: &str) -> LogSummary {
+        let mut by_plugin: Vec<PluginStat> = self
+            .plugin_total
+            .into_iter()
+            .map(|(plugin_name, total)| {
+                let errors = self.plugin_errors.get(&plugin_name).copied().unwrap_or(0);
+                PluginStat {
+                    plugin_name,
+                    total,
+                    errors,
+                }
+            })
+            .collect();
+        // 异常多的排前，其次总量，最后名字（保证顺序稳定可测）
+        by_plugin.sort_by(|a, b| {
+            b.errors
+                .cmp(&a.errors)
+                .then(b.total.cmp(&a.total))
+                .then(a.plugin_name.cmp(&b.plugin_name))
+        });
+
+        let mut top_errors: Vec<ErrorCluster> = self.clusters.into_values().collect();
+        top_errors.sort_by(|a, b| b.count.cmp(&a.count).then(a.pattern.cmp(&b.pattern)));
+        top_errors.truncate(MAX_ERROR_CLUSTERS);
+        for c in &mut top_errors {
+            c.plugins.sort();
+        }
+
+        LogSummary {
+            date: date.to_string(),
+            total: self.total,
+            by_level: self.by_level,
+            by_plugin,
+            top_errors,
+        }
+    }
+}
+
+/// 扫描某天全部日志（含切分文件）并聚合，**不受分页上限约束**。
+///
+/// 与 `read_log_page_from_dir` 一样逐行流式处理，不把条目累积进内存。
+pub fn summarize_log_dir(dir: &Path, date: &str, error_only: bool) -> Result<LogSummary, String> {
+    use std::io::{BufRead, BufReader};
+
+    let base_name = if error_only {
+        build_error_log_filename(date)
+    } else {
+        build_log_filename(date)
+    };
+
+    let mut acc = SummaryAccumulator::default();
+    let mut candidates = vec![dir.join(&base_name)];
+    for idx in 1..u32::MAX {
+        let rotated = dir.join(build_rotated_filename(&base_name, idx));
+        if !rotated.exists() {
+            break;
+        }
+        candidates.push(rotated);
+    }
+
+    for path in candidates {
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if let Some(entry) = parse_log_line(&line) {
+                acc.push(&entry);
+            }
+        }
+    }
+
+    Ok(acc.finish(date))
+}
+
+/// 从内存中已有的条目聚合（供测试与小批量场景）。
+///
+/// 大批量请用 `summarize_log_dir`——它不需要先把全部条目读进内存。
+pub fn summarize_entries(date: &str, entries: &[LogEntry]) -> LogSummary {
+    let mut acc = SummaryAccumulator::default();
+    for e in entries {
+        acc.push(e);
+    }
+    acc.finish(date)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +1030,195 @@ mod tests {
             ));
         }
         fs::write(dir.join(build_log_filename(date)), content).expect("写入样例日志失败");
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 跨实例异常聚合（DEV-125123）
+    // ─────────────────────────────────────────────────────────
+
+    fn entry(ts: &str, level: &str, plugin: &str, msg: &str) -> LogEntry {
+        LogEntry {
+            timestamp: ts.to_string(),
+            level: level.to_string(),
+            source: "background".to_string(),
+            plugin_name: plugin.to_string(),
+            message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_normalize_replaces_multi_digit_numbers() {
+        // 同一问题的不同 ID 必须归成一类，否则几万条各不相同的消息会产出
+        // 几万个「类别」，聚合完全失去意义
+        assert_eq!(
+            normalize_error_pattern("商品 12345 抓取失败"),
+            normalize_error_pattern("商品 67890 抓取失败"),
+            "只有 ID 不同的同类错误必须归并"
+        );
+    }
+
+    #[test]
+    fn test_normalize_keeps_single_digit() {
+        // 「第 1 步」这类序号是特征本身，不该被抹掉
+        let a = normalize_error_pattern("第 1 步失败");
+        let b = normalize_error_pattern("第 2 步失败");
+        assert_ne!(a, b, "单个数字属于特征，不应归并");
+    }
+
+    #[test]
+    fn test_normalize_replaces_urls_wholesale() {
+        assert_eq!(
+            normalize_error_pattern("请求 https://air.1688.com/x?id=99 超时"),
+            normalize_error_pattern("请求 https://detail.1688.com/y?id=1 超时"),
+            "URL 应整段替换，否则同一接口的不同参数会被当成不同错误"
+        );
+    }
+
+    #[test]
+    fn test_normalize_preserves_chinese() {
+        // 按字节推进会截断中文，必须按字符边界处理
+        let out = normalize_error_pattern("供应商未回复");
+        assert_eq!(out, "供应商未回复", "中文必须原样保留，不能出现乱码");
+    }
+
+    #[test]
+    fn test_summary_counts_by_level() {
+        let entries = vec![
+            entry("2026-08-22 10:00:00.000", "ERROR", "robot-01", "崩了"),
+            entry("2026-08-22 10:00:01.000", "INFO", "robot-01", "正常"),
+            entry("2026-08-22 10:00:02.000", "INFO", "robot-02", "正常"),
+        ];
+        let s = summarize_entries("2026-08-22", &entries);
+        assert_eq!(s.total, 3);
+        assert_eq!(s.by_level.get("ERROR"), Some(&1));
+        assert_eq!(s.by_level.get("INFO"), Some(&2));
+    }
+
+    #[test]
+    fn test_summary_ranks_instances_by_error_count() {
+        // 「哪个实例在报错」是 AI 排查的第一个问题，异常多的必须排最前
+        let mut entries = vec![entry("2026-08-22 10:00:00.000", "INFO", "robot-01", "正常")];
+        for i in 0..5 {
+            entries.push(entry(
+                "2026-08-22 10:00:01.000",
+                "ERROR",
+                "robot-07",
+                &format!("抓取失败 {}", i * 100),
+            ));
+        }
+        let s = summarize_entries("2026-08-22", &entries);
+        assert_eq!(
+            s.by_plugin[0].plugin_name, "robot-07",
+            "错误最多的实例必须排最前，实际: {:?}",
+            s.by_plugin
+        );
+        assert_eq!(s.by_plugin[0].errors, 5);
+        assert_eq!(s.by_plugin[1].errors, 0);
+    }
+
+    #[test]
+    fn test_summary_clusters_same_error_across_instances() {
+        // 「3 台同时报同一个错」与「1 台报了 3 次」是完全不同的问题，
+        // plugins 字段就是为区分这两者存在的
+        let entries = vec![
+            entry("2026-08-22 10:00:00.000", "ERROR", "robot-01", "商品 111 抓取失败"),
+            entry("2026-08-22 10:00:05.000", "ERROR", "robot-02", "商品 222 抓取失败"),
+            entry("2026-08-22 10:00:09.000", "ERROR", "robot-03", "商品 333 抓取失败"),
+        ];
+        let s = summarize_entries("2026-08-22", &entries);
+        assert_eq!(s.top_errors.len(), 1, "三条同类错误应归并为一类");
+        let c = &s.top_errors[0];
+        assert_eq!(c.count, 3);
+        assert_eq!(
+            c.plugins,
+            vec!["robot-01", "robot-02", "robot-03"],
+            "必须记录出现过该错误的全部实例"
+        );
+        assert_eq!(c.first_seen, "2026-08-22 10:00:00.000");
+        assert_eq!(c.last_seen, "2026-08-22 10:00:09.000");
+        assert!(c.sample.contains("111"), "sample 应保留一条未归一的原始消息");
+    }
+
+    #[test]
+    fn test_summary_sorts_clusters_by_count() {
+        let mut entries = vec![entry("2026-08-22 10:00:00.000", "ERROR", "robot-01", "少见错误")];
+        for _ in 0..4 {
+            entries.push(entry("2026-08-22 10:00:01.000", "ERROR", "robot-01", "常见错误"));
+        }
+        let s = summarize_entries("2026-08-22", &entries);
+        assert_eq!(s.top_errors[0].pattern, "常见错误", "出现次数多的排前");
+        assert_eq!(s.top_errors[0].count, 4);
+    }
+
+    #[test]
+    fn test_summary_counts_warn_as_error() {
+        // 与 is_error_level 口径一致：WARN 也进异常统计，否则「异常单独归集」
+        // 的文件里有 WARN 而聚合里没有，两处对不上
+        let entries = vec![entry("2026-08-22 10:00:00.000", "WARN", "robot-01", "重试中")];
+        let s = summarize_entries("2026-08-22", &entries);
+        assert_eq!(s.by_plugin[0].errors, 1, "WARN 应计入异常");
+        assert_eq!(s.top_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_summarize_log_dir_reads_rotated_files() {
+        // 切分文件必须一并统计，否则当天后半段日志的异常被漏掉
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let dir = tmp.path();
+        let base = build_log_filename("2026-08-22");
+        fs::write(
+            dir.join(&base),
+            "[2026-08-22 10:00:00.000] [ERROR] [background] [robot-01] 主文件错误 111\n",
+        )
+        .expect("写入失败");
+        fs::write(
+            dir.join(build_rotated_filename(&base, 1)),
+            "[2026-08-22 11:00:00.000] [ERROR] [background] [robot-02] 主文件错误 222\n",
+        )
+        .expect("写入失败");
+
+        let s = summarize_log_dir(dir, "2026-08-22", false).expect("聚合应成功");
+        assert_eq!(s.total, 2, "切分文件必须一并统计");
+        assert_eq!(s.top_errors.len(), 1, "跨文件的同类错误应归并");
+        assert_eq!(s.top_errors[0].plugins, vec!["robot-01", "robot-02"]);
+    }
+
+    #[test]
+    fn test_summarize_log_dir_missing_file_returns_empty() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let s = summarize_log_dir(tmp.path(), "2099-01-01", false)
+            .expect("无日志应返回空聚合而非报错");
+        assert_eq!(s.total, 0);
+    }
+
+    #[test]
+    fn test_summary_of_empty_input_does_not_panic() {
+        let s = summarize_entries("2026-08-22", &[]);
+        assert_eq!(s.total, 0);
+        assert!(s.by_plugin.is_empty());
+        assert!(s.top_errors.is_empty());
+        assert_eq!(s.date, "2026-08-22");
+    }
+
+    #[test]
+    fn test_summary_caps_cluster_count() {
+        // 长尾对判断没帮助；条数多时应改用筛选查明细而非扩大这个数
+        let entries: Vec<LogEntry> = (0..MAX_ERROR_CLUSTERS + 10)
+            .map(|i| {
+                entry(
+                    "2026-08-22 10:00:00.000",
+                    "ERROR",
+                    "robot-01",
+                    &format!("错误类型{}", char::from(b'a' + (i % 26) as u8)),
+                )
+            })
+            .collect();
+        let s = summarize_entries("2026-08-22", &entries);
+        assert!(
+            s.top_errors.len() <= MAX_ERROR_CLUSTERS,
+            "类别数必须有上限，实际 {}",
+            s.top_errors.len()
+        );
     }
 
     #[test]
