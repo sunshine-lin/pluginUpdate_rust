@@ -535,7 +535,9 @@ function App() {
   return (
     <main
       className={
-        view === "logs" || view === "patrol" ? "container container-wide" : "container"
+        // 所有页面统一宽布局：窗口默认已加宽到 900px（巡检页 8 列表格需要），
+        // 只让部分页面放开的话，切 tab 时内容区宽度会左右跳动
+        "container container-wide"
       }
     >
       <div className="view-tabs">

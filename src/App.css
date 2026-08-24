@@ -66,20 +66,28 @@
 /* 外层视图切换（更新管理 / 日志查看）：下划线式标签，与下方卡片式环境 Tab 区分层级 */
 .view-tabs {
   display: flex;
-  justify-content: center;
+  align-items: center;
   gap: 32px;
   margin-bottom: 20px;
   border-bottom: 1px solid #e0e0e6;
   position: relative;
 }
 
-/* 版本号靠右绝对定位：不占据流内空间，标签仍保持整体居中 */
+/* 标签整体居中：左右各放一个自动外边距的占位，版本号才不会挤压标签位置 */
+.view-tabs::before {
+  content: "";
+  flex: 1;
+}
+
+/* 版本号改为流内布局并靠右。
+   原先用 position:absolute; right:0 —— 窗口加宽到 900px 后，绝对定位的版本号
+   会盖在「机器状态」标签上（实测两者文字重叠）。改成 flex 成员后由布局保证
+   互不重叠，无论窗口多宽 */
 .app-version {
-  position: absolute;
-  right: 0;
-  bottom: 8px;
+  flex: 1;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
   font-size: 12px;
   color: #999;
@@ -524,6 +532,17 @@
 .container-wide {
   max-width: none;
   width: 100%;
+}
+
+/* 更新管理与机器状态页的内容不必撑满 900px——一行只放一个输入框会显得很空。
+   设上限并居中，视觉上与日志/巡检页的表格区左右对齐 */
+.env-tabs,
+.info-card,
+.machine-status-grid,
+.actions {
+  max-width: 1100px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .log-view {
