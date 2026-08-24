@@ -109,8 +109,58 @@ const SELF_UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 /// 用 state 无法在第二次执行时读到第一次的结果（闭包捕获的是旧值）
 let selfUpdateStarted = false;
 
-/// 上一次记录过的自更新错误，用于抑制重复日志（见 runSelfUpdateCheck）
-let lastSelfUpdateError: string | null = null;
+/// 自更新请求统一带的 Accept 头。
+///
+/// # 为什么必须显式指定
+/// tauri-plugin-updater 在两个请求上填不同的默认值（updater.rs:389 / :659）：
+/// check 用 `application/json`、download 用 `application/octet-stream`。
+/// 而 chainai 站点的边缘 nginx 对 Accept 不含 `*/*`、也不像 json 的请求
+/// **整站返回 500** —— 于是表现成「检查更新成功、下载必失败」，十几台采购机
+/// 的自动升级从此全瘫（2026-08-24 实测：那天每 4 小时报一次 500，无一台升上来）。
+///
+/// 插件源码是 `if !headers.contains_key(ACCEPT)`，我们自己传就能覆盖默认值。
+/// 用 `*/*` 而不是别的：实测该站点只放行含 `*/*` 或 `application/json` 的请求，
+/// 而 `*/*` 语义上就是「什么都收」，对下载二进制完全正确。
+const SELF_UPDATE_HEADERS = { Accept: "*/*" };
+
+/// 同一条自更新错误的最短重记间隔：1 小时。
+///
+/// # 为什么按时间窗，而不是「只记一次」
+/// 原先用 `lastSelfUpdateError` 做「同一错误只记一次、直到某次 check 成功才解除」。
+/// 那在**持续失败**下会永久静默：断网的机器 check 每次都失败、永远等不到解除，
+/// 于是第一条之后再也不记。排查者看到日志里没有异常，会误判成「这台没问题」——
+/// 而这恰是最需要发现的状态。按时间窗则保证「一直坏就一直有记录」。
+const SELF_UPDATE_ERROR_WINDOW_MS = 60 * 60 * 1000;
+
+/// 自更新错误 → 上次记录时刻。配合上面的时间窗做抑制
+const selfUpdateErrorSeen = new Map<string, number>();
+
+function shouldLogSelfUpdateError(key: string): boolean {
+  const now = Date.now();
+  const prev = selfUpdateErrorSeen.get(key);
+  if (prev !== undefined && now - prev < SELF_UPDATE_ERROR_WINDOW_MS) return false;
+  selfUpdateErrorSeen.set(key, now);
+  return true;
+}
+
+/// 从 latest.json 原文里取出本平台的下载地址。
+///
+/// 插件的 JS 类型没有暴露 downloadUrl（见 @tauri-apps/plugin-updater 的
+/// UpdateMetadata），但 rawJson 是完整清单，自己取即可。失败日志里必须带地址：
+/// 指错环境（测试包发到线上机）时靠它才能一眼看出来。
+function resolveDownloadUrl(rawJson: Record<string, unknown>): string {
+  const platforms = (rawJson?.platforms ?? {}) as Record<
+    string,
+    { url?: string }
+  >;
+  const osPrefix = navigator.userAgent.includes("Windows")
+    ? "windows"
+    : navigator.userAgent.includes("Mac")
+      ? "darwin"
+      : "";
+  const key = Object.keys(platforms).find((k) => k.startsWith(osPrefix));
+  return (key && platforms[key]?.url) || "（清单未给出本平台地址）";
+}
 
 /// 更新器自身的更新状态
 type SelfUpdateState =
@@ -198,49 +248,77 @@ function App() {
     if (checkingUpdate) return; // 防止连点或与轮询重入
     setCheckingUpdate(true);
     if (trigger === "manual") setSelfUpdateHint("正在检查更新…");
+    const startedAt = Date.now();
+    // 下载地址在失败日志里是必备字段，但只有拿到 update 才知道。
+    // 提前声明，让 catch 分支也能用上（check 阶段就失败时保持「未知」）
+    let downloadUrl = "（未取到清单）";
+    let stage = "检查";
     try {
-      const update = await check();
-      lastSelfUpdateError = null; // 本次成功，解除同错误抑制
+      const update = await check({ headers: SELF_UPDATE_HEADERS });
       if (!update) {
+        // **成功也记**：原先只在失败时写日志，于是「这台机器还在检查更新吗」
+        // 根本判断不了 —— 定时器死了、进程僵住、一切正常，在日志里长得一模一样
+        // （都是没有日志）。每 4 小时一条的节律本身就是客户端存活心跳。
+        // 直接问 getVersion() 而不用 appVersion state：后者由另一个 effect
+        // 异步填充，而自动检查在挂载时立即跑一次——首次必然读到空串，
+        // 于是每次启动的第一条日志都会记成「当前=未知」，恰好是最想知道版本的时刻
+        const current = await getVersion().catch(() => "未知");
+        invoke("log_self_update_check", {
+          current,
+          remote: current, // check() 返回 null ⇒ 远端不比本地新
+          verdict: "已是最新",
+          elapsedMs: Date.now() - startedAt,
+        }).catch(() => {});
         if (trigger === "manual") setSelfUpdateHint("已是最新版本");
         return;
       }
+      downloadUrl = resolveDownloadUrl(update.rawJson);
+      invoke("log_self_update_check", {
+        current: update.currentVersion,
+        remote: update.version,
+        verdict: "发现新版",
+        elapsedMs: Date.now() - startedAt,
+      }).catch(() => {});
       setSelfUpdateHint("");
-      // 先确认清单里有当前系统的包，再进入下载状态。
-      // 否则在只发布 Windows 包的情况下，macOS 上会先切成「正在下载」
-      // 再抛错——用户看到的是永远转不完的下载提示。
-      //
-      // 清单的平台键形如 windows-x86_64 / darwin-aarch64，前缀即系统名。
-      // 只按前缀做保守判断：一个都不沾边时才跳过，避免误判导致该升的没升
-      const platforms = Object.keys(
-        (update.rawJson?.platforms ?? {}) as Record<string, unknown>
-      );
-      const osPrefix = navigator.userAgent.includes("Windows")
-        ? "windows"
-        : navigator.userAgent.includes("Mac")
-          ? "darwin"
-          : "";
-      const hasPlatform =
-        platforms.length === 0 || // 清单没声明平台，交给插件自行处理
-        !osPrefix ||              // 认不出系统，不擅自跳过
-        platforms.some((k) => k.startsWith(osPrefix));
-      if (!hasPlatform) {
-        if (trigger === "manual") setSelfUpdateHint("当前系统暂无更新包");
-        return;
-      }
-      setSelfUpdate({ kind: "downloading", version: update.version });
+      stage = "下载";
       // 拆成 download + install 两步而非 downloadAndInstall()：后者失败时
-      // 无法判断卡在下载还是安装，而这两者的成因完全不同（网络 vs 权限/占用）。
-      // 进度也一并落盘——上次故障机「一直显示下载中」，无从判断是没开始、
-      // 下到一半断了、还是下完卡在安装
+      // 无法判断卡在下载还是安装，而这两者的成因完全不同（网络 vs 权限/占用）
       let received = 0;
       let total = 0;
-      await update.download((ev) => {
-        if (ev.event === "Started") total = ev.data.contentLength ?? 0;
-        else if (ev.event === "Progress") received += ev.data.chunkLength;
-      });
+      let nextMilestone = 25;
+      const downloadStartedAt = Date.now();
+      await update.download(
+        (ev) => {
+          if (ev.event === "Started") {
+            total = ev.data.contentLength ?? 0;
+            // 状态切到「正在下载」推迟到**确认服务端开始回数据之后**。
+            // 原先在 download() 之前就切，于是服务端直接拒绝（如 500）时，
+            // 界面会先显示「正在后台下载…」再跳出报错——看起来像下到一半坏了，
+            // 实际一个字节都没下，把排查方向带偏
+            setSelfUpdate({ kind: "downloading", version: update.version });
+          } else if (ev.event === "Progress") {
+            received += ev.data.chunkLength;
+            // 按里程碑记而不是每个 chunk 记：4MB 的包有上千个 chunk。
+            // 有了进度才能区分「卡住」和「失败」——卡住时界面停在下载中、
+            // 日志里既无失败也无完成，是最难现场排查的一种状态
+            if (total > 0 && (received * 100) / total >= nextMilestone) {
+              invoke("log_self_update_progress", {
+                received,
+                total,
+                elapsedMs: Date.now() - downloadStartedAt,
+              }).catch(() => {});
+              nextMilestone += 25;
+            }
+          }
+        },
+        { headers: SELF_UPDATE_HEADERS }
+      );
+      stage = "安装";
+      // install() 之后进程即重启，「安装成功」这条永远写不进去。
+      // 记下「即将退出安装」，配上下次启动的「客户端启动，版本 X（升级前 Y）」，
+      // 安装到底有没有发生就闭环了
       invoke("log_self_update_info", {
-        message: `下载完成 ${received}/${total} 字节，开始安装 ${update.version}`,
+        message: `下载完成 ${received}/${total} 字节，即将退出并安装 ${update.version}`,
       }).catch(() => {});
       await update.install();
       // body 来自 latest.json 的 notes 字段，用于告知这次更新改了什么；
@@ -252,25 +330,57 @@ function App() {
       });
     } catch (e) {
       const msg = String(e);
-      // 下载/安装失败必须把界面状态收回来。否则提示条会永远停在
-      // 「正在后台下载…」——既不报错也不消失，比直接说失败更让人困惑。
-      // 断网、站点 502、磁盘满都会走到这里，不只是平台不匹配
+      const elapsedMs = Date.now() - startedAt;
+      // 失败必须把界面状态收回来。否则提示条会永远停在「正在后台下载…」——
+      // 既不报错也不消失，比直接说失败更让人困惑
       setSelfUpdate({ kind: "idle" });
-      // 手动触发时把真实错误显示出来。此前只提示「请稍后再试」、原因仅进日志，
-      // 排查者必须去翻日志文件才知道发生了什么——而自更新失败恰恰是最需要
-      // 现场信息的场景。自动轮询仍保持安静，不打扰正在干活的采购同事
-      if (trigger === "manual") setSelfUpdateHint(`更新失败：${msg}`);
-      // 当前平台不在清单里属正常情况（只发布 Windows 包），不是故障：
-      // 记成 ERROR 会污染「仅异常」视图，且每轮必然复现、长期累积
+
+      // 当前平台不在清单里属正常情况（只发布 Windows 包），不是故障。
+      //
+      // 这个判断必须放在 catch 里：check() 内部在**版本比较之前**就调
+      // get_urls()?（updater.rs:534），清单没有本平台的键时它直接抛错 ——
+      // 哪怕根本不需要更新。原先在 check() 之后做的平台预检是死代码，
+      // 走不到，于是 macOS 上点「检查更新」看到的是一句生英文报错
       const isPlatformMissing = msg.includes("were found in the response");
-      // 同一错误连续出现时只记一次——某台机器长期断网时，
-      // 每 4 小时记一条相同内容，一个月会攒出上百条无用日志
-      const isRepeat = msg === lastSelfUpdateError;
-      if (!isPlatformMissing && !isRepeat) {
-        lastSelfUpdateError = msg;
-        // 自更新失败不弹错打扰用户：采购同事看到红色报错既看不懂也无从处理。
-        // 写进日志文件，由排查者从日志页查看。
-        invoke("log_self_update_error", { message: msg }).catch(() => {});
+      if (isPlatformMissing) {
+        if (trigger === "manual") setSelfUpdateHint("当前系统暂无更新包");
+        // 记成 INFO 而非 ERROR（不污染「仅异常」视图），但**必须记** ——
+        // 不记就等于留了一条静默路径：这台机器每 4 小时走一次这里、日志里
+        // 一个字都没有，与「定时器死了」无法区分。而「看到没有日志就以为没问题」
+        // 正是 2026-08-24 那次栽跟头的方式
+        if (shouldLogSelfUpdateError(msg)) {
+          invoke("log_self_update_check", {
+            current: await getVersion().catch(() => "未知"),
+            remote: "未知",
+            verdict: "清单无本平台包（只发布 Windows 包时属正常）",
+            elapsedMs,
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      // 报错文案要让非技术人员看得懂：采购同事看到
+      // 「Download request failed with status: 500 Internal Server Error」
+      // 既不懂、也不知道该找谁。原因照旧完整进日志，界面只给能行动的一句话
+      if (trigger === "manual") {
+        setSelfUpdateHint(
+          `更新失败（${stage}阶段），已记入日志，请联系 IT。`
+        );
+      }
+
+      if (shouldLogSelfUpdateError(msg)) {
+        invoke("log_self_update_failure", {
+          stage,
+          url: downloadUrl,
+          detail: `详情=${msg}`,
+          elapsedMs,
+        }).catch(() => {});
+        // 失败后对同一地址做一次带/不带 Accept 的对比探测，让日志自己说出
+        // 根因类别。2026-08-24 的 500 是人手动 curl 对比才定位的，
+        // 中间怀疑过网络、CDN、文件损坏——那些弯路这条探针能省掉
+        if (stage === "下载" && downloadUrl.startsWith("http")) {
+          invoke("diagnose_download_url", { url: downloadUrl }).catch(() => {});
+        }
       }
       console.error("自动更新检查失败:", e);
     } finally {

@@ -46,6 +46,13 @@ struct PathConfig {
     /// 接了集中上报再补，此前所有日志都无法归属到机器。
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_id: Option<String>,
+    /// 上次启动时记录的版本号（DEV-122552）。
+    ///
+    /// 存在的唯一理由是让启动日志能区分「刚升上来」与「只是重启」——
+    /// 逐台核实一次 rollout 时，没有它就只能看到「版本 0.3.1」，
+    /// 分不清这台是升级成功了还是本来就是这版。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_version: Option<String>,
     /// 透传本结构未声明的字段。serde 默认丢弃未知字段，
     /// 若不保留会在写入任一配置项时静默抹掉其它程序写入的数据
     #[serde(flatten)]
@@ -802,8 +809,239 @@ pub fn log_client_info(message: &str) {
 /// 十几台采购机器的日志汇总在一起时，靠这条判断每台各自跑的是哪个版本。
 /// 自更新失败为静默设计，没有这条就无法发现某台卡在旧版没升上来。
 /// 前缀固定为「客户端启动」，便于按关键词筛出各机器的版本分布
-pub fn build_startup_version_line(version: &str) -> String {
-    format!("客户端启动，版本 {}", version)
+///
+/// # 为什么要带上一版本
+/// 逐台核实一次 rollout 时，只看「启动，版本 0.3.1」分不清这台是**刚升上来的**
+/// 还是**本来就是这版**。带上变化前的版本，升级成功与否一眼可判；版本没变时
+/// 不加这段，避免每次重启都被读成一次升级（那会让核实结果全是假阳性）。
+pub fn build_startup_version_line(version: &str, previous: Option<&str>) -> String {
+    match previous {
+        Some(prev) if prev != version => {
+            format!("客户端启动，版本 {}（升级前 {}）", version, prev)
+        }
+        _ => format!("客户端启动，版本 {}", version),
+    }
+}
+
+/// 读取上次记录的版本号，并把当前版本写回配置。
+///
+/// 返回上次记录的版本（首次运行为 `None`）。供启动日志区分「升级」与「重启」。
+/// 复用 `PathConfig` 的 `#[serde(flatten)] extra` 兜底，加字段不会抹掉
+/// 安装路径与 machine_id —— 后者一变就等于换了台新机器，历史日志全部对不上。
+pub fn load_and_record_version(config_file: &PathBuf, current: &str) -> Option<String> {
+    let mut cfg: PathConfig = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        PathConfig::default()
+    };
+    let previous = cfg.last_version.take().filter(|s| !s.is_empty());
+    cfg.last_version = Some(current.to_string());
+    if let Some(parent) = config_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // 写失败只影响下次启动能否说出「升级前是哪版」，不该阻断启动
+    if let Ok(content) = serde_json::to_string_pretty(&cfg) {
+        let _ = fs::write(config_file, content);
+    }
+    previous
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 自更新可观测性（DEV-122551 / DEV-122552）
+//
+// 十几台采购机升一次的代价很高（自动升级链路本身就是坏的，见下），所以
+// 「排查这条链路需要的日志」必须在升级前一次埋够，而不是升上去再发现少了字段。
+//
+// 2026-08-24 的实测教训：那天客户端每 4 小时报一次
+// `自动更新失败: Download request failed with status: 500`，日志里除了这句
+// 什么都没有 —— 没有地址、没有响应体、没有耗时，成功时更是一个字不写。
+// 根因（服务端对 `Accept: application/octet-stream` 整站返回 500）是靠人反复
+// curl 对比才定位的。下面这批日志的目标就是让同类问题在日志里自己说出结论。
+// ─────────────────────────────────────────────────────────────────
+
+/// 同一条日志在时间窗内只记一次。
+///
+/// # 为什么不用「只记一次、直到成功才解除」
+/// 那是前端原来的写法（`lastSelfUpdateError`）。它在**持续失败**下会永久静默：
+/// 断网的机器 `check()` 每次都失败、永远等不到那次「成功」来解除抑制，于是第一条
+/// 之后再也不记。排查者看到日志里没有异常，会误判成「这台机器没问题」——
+/// 而这恰好是最需要发现的状态。
+///
+/// 按时间窗抑制则保证「一直坏就一直有记录」，只是把频率压到可接受。
+pub struct LogThrottle {
+    last: std::collections::HashMap<String, std::time::Instant>,
+    window: std::time::Duration,
+}
+
+impl LogThrottle {
+    pub fn new(window: std::time::Duration) -> Self {
+        Self {
+            last: std::collections::HashMap::new(),
+            window,
+        }
+    }
+
+    /// 判断此刻是否应该记录 `key` 这条日志。返回 true 时同步刷新计时。
+    pub fn should_log(&mut self, key: &str, now: std::time::Instant) -> bool {
+        match self.last.get(key) {
+            Some(&prev) if now.saturating_duration_since(prev) < self.window => false,
+            _ => {
+                self.last.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+}
+
+/// 每次自更新检查完成后都记一条 —— **成功也记**。
+///
+/// # 为什么成功也要记
+/// 原先只在失败时写日志，于是「这台机器还在检查更新吗」根本判断不了：
+/// 定时器死了、进程僵住、和一切正常，在日志里长得一模一样（都是没有日志）。
+/// 每 4 小时一条的节律本身就是心跳 —— 超过一个周期没有这条，就是客户端出问题了。
+pub fn build_self_update_check_line(
+    current: &str,
+    remote: &str,
+    verdict: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "[自更新] 检查完成 当前={} 远端={} 结论={} 耗时={}ms",
+        current, remote, verdict, elapsed_ms
+    )
+}
+
+/// 自更新某个阶段失败时记录完整上下文。
+///
+/// `stage` 形如「检查」「下载」「安装」；`detail` 承载状态码、响应体片段等。
+/// 地址必须带上：指错环境（测试包发到线上机）时，靠它才能一眼看出来。
+pub fn build_self_update_failure_line(
+    stage: &str,
+    url: &str,
+    detail: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "[自更新] {}失败 url={} {} 耗时={}ms",
+        stage, url, detail, elapsed_ms
+    )
+}
+
+/// 把字节数格式化成人类可读形式。采购机上的日志也可能被人直接打开看
+pub fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1}MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0}KB", b / KB)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// 下载过程中的里程碑日志。
+///
+/// # 为什么需要进度而不只是结果
+/// 原先只在下载**完成后**记一次总量，于是「卡住」这种状态完全看不出来 ——
+/// 而卡住（不是报错、就是不动）恰好是最难现场排查的一种：界面停在「正在下载」，
+/// 日志里既没有失败也没有完成，无从判断是没开始、下到一半断了、还是很慢。
+///
+/// `total` 为 0 表示服务端没给 Content-Length，此时不输出百分比 ——
+/// 凭空算一个假进度比不给更糟。
+pub fn build_download_progress_line(received: u64, total: u64, elapsed_ms: u128) -> String {
+    let speed = if elapsed_ms > 0 {
+        let bps = (received as f64) * 1000.0 / (elapsed_ms as f64);
+        format!(" 速度={}/s", format_bytes(bps as u64))
+    } else {
+        String::new()
+    };
+    if total > 0 {
+        format!(
+            "[自更新] 下载中 {}% {}/{}{}",
+            received * 100 / total,
+            format_bytes(received),
+            format_bytes(total),
+            speed
+        )
+    } else {
+        format!(
+            "[自更新] 下载中 {}（总量未知）{}",
+            format_bytes(received),
+            speed
+        )
+    }
+}
+
+/// 根据「带 Accept」与「不带 Accept」两次探测的结果给出结论。
+///
+/// # 这条为什么值得埋
+/// 2026-08-24 的根因是服务端对 `Accept: application/octet-stream` 返回 500，
+/// 而同一地址不带该头返回 200 —— 定位过程是人手动 curl 对比出来的。
+/// 把这个对比做成失败路径上的自动探针，同类问题下次会在日志里直接给出结论，
+/// 不必再有人去猜是网络、是服务端、还是请求头。
+///
+/// 探针对**任何**「服务端挑请求」的故障都有效，不是只针对这一次。
+pub fn build_diagnosis_verdict(with_accept: Option<u16>, without_accept: Option<u16>) -> String {
+    match (with_accept, without_accept) {
+        (None, None) => {
+            "两种请求都发不出去 ⇒ 网络不通或 DNS 解析失败，不是服务端拒绝".to_string()
+        }
+        (Some(bad), Some(ok)) if bad >= 400 && ok < 400 => format!(
+            "带 Accept: application/octet-stream 返回 {}、不带返回 {} ⇒ 服务端按请求头拒绝，非网络故障",
+            bad, ok
+        ),
+        (Some(a), Some(b)) if a < 400 && b < 400 => format!(
+            "诊断时两种请求都正常（{} / {}）⇒ 瞬时故障，重试即可",
+            a, b
+        ),
+        (Some(a), Some(b)) => format!("带 Accept={}、不带={} ⇒ 服务端两种都拒，检查地址是否有效", a, b),
+        (Some(a), None) => format!("带 Accept={}，不带 Accept 请求发不出去 ⇒ 结果不可靠，建议重试", a),
+        (None, Some(b)) => format!(
+            "带 Accept 请求发不出去、不带返回 {} ⇒ 疑似请求头触发中间设备拦截",
+            b
+        ),
+    }
+}
+
+/// 从 Tauri 的插件配置里取出自更新清单地址。
+///
+/// 不写成常量是为了**不可能漂移**：真实生效的地址在 `tauri.conf.json` 的
+/// `plugins.updater.endpoints`，另抄一份常量迟早会和它不一致，而那种不一致最坑 ——
+/// 日志上报的地址与实际请求的地址不同，排查者会朝着错误方向查很久。
+///
+/// 取不到时返回「未配置」而非 panic：这只是日志里的一个字段，
+/// 不该因为读不到配置就影响启动。
+pub fn extract_updater_endpoint(plugins: &serde_json::Value) -> String {
+    plugins
+        .get("updater")
+        .and_then(|u| u.get("endpoints"))
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("未配置")
+        .to_string()
+}
+
+/// 构建放行日志端口的防火墙规则命令（纯函数，可测）。
+///
+/// # 为什么客户端自己也试一次
+/// NSIS 安装钩子只在有管理员权限时才能加规则，而**自动升级时更新器不是管理员**，
+/// 那条钩子不会生效。端口没放行的后果很具体：AI 读不到那台机器的日志，
+/// 于是连「它到底升没升」都无从确认 —— 日志埋得再全也救不了读取通道本身被挡住。
+///
+/// 客户端启动时尽力试一次：成了最好，没权限也把失败原因记进日志（本机可读）。
+/// 只放行入站；出站本来就不受限，多加规则等于无谓扩大暴露面。
+pub fn build_firewall_rule_script_windows(port: u16) -> String {
+    format!(
+        "netsh advfirewall firewall add rule name=\"aichat-updater\" \
+         dir=in action=allow protocol=TCP localport={}",
+        port
+    )
 }
 
 /// 获取日志服务端口，供前端展示与插件侧发现（0 表示服务未启动）
@@ -825,6 +1063,133 @@ fn log_self_update_error(message: String) {
 #[tauri::command]
 fn log_self_update_info(message: String) {
     log_client_info(&format!("自动更新: {}", message));
+}
+
+/// 记录一次自更新检查的结果（**成功也记**）。
+///
+/// 见 `build_self_update_check_line` 的文档：这条同时充当客户端存活心跳，
+/// 没有它就无法区分「定时器死了」和「一切正常」。
+#[tauri::command]
+fn log_self_update_check(current: String, remote: String, verdict: String, elapsed_ms: u64) {
+    log_client_info(&build_self_update_check_line(
+        &current,
+        &remote,
+        &verdict,
+        elapsed_ms as u128,
+    ));
+}
+
+/// 记录自更新某阶段失败的完整上下文（地址、状态、耗时）。
+#[tauri::command]
+fn log_self_update_failure(stage: String, url: String, detail: String, elapsed_ms: u64) {
+    log_client_error(&build_self_update_failure_line(
+        &stage,
+        &url,
+        &detail,
+        elapsed_ms as u128,
+    ));
+}
+
+/// 记录下载进度里程碑。INFO 级，不进异常文件。
+#[tauri::command]
+fn log_self_update_progress(received: u64, total: u64, elapsed_ms: u64) {
+    log_client_info(&build_download_progress_line(
+        received,
+        total,
+        elapsed_ms as u128,
+    ));
+}
+
+/// 下载失败后对同一地址做一次对比探测，把结论写进日志。
+///
+/// 发两个 HEAD：一个带 `Accept: application/octet-stream`（复现 updater 的行为）、
+/// 一个不带。两者结果的差异直接指向根因类别 —— 详见 `build_diagnosis_verdict`。
+///
+/// # 为什么在失败路径上再发网络请求是值得的
+/// 只在失败后触发，频率被自更新周期（4 小时）天然限制；而它换来的是
+/// 「日志自己说出根因类别」。2026-08-24 那次，人靠手动 curl 对比才定位到
+/// 是请求头问题，中间一度怀疑过网络、CDN、文件损坏 —— 那些弯路这条探针能省掉。
+#[tauri::command]
+async fn diagnose_download_url(url: String) -> String {
+    let verdict = match probe_download_url(&url).await {
+        Ok((with_accept, without_accept)) => {
+            build_diagnosis_verdict(with_accept, without_accept)
+        }
+        Err(e) => format!("诊断探针无法创建 HTTP 客户端: {}", e),
+    };
+    log_client_error(&format!("[自更新] 自诊断 url={} {}", url, verdict));
+    verdict
+}
+
+/// 对同一地址发两次 HEAD：一次带 `Accept: application/octet-stream`（复现
+/// updater 的行为）、一次不带。返回各自的状态码（发不出去为 `None`）。
+///
+/// 与 `diagnose_download_url` 分开是为了能对真实服务端做集成验证 ——
+/// 判断逻辑（`build_diagnosis_verdict`）有单测，但「服务端真的会这么回吗」
+/// 只有打一次真实请求才算证实。
+pub async fn probe_download_url(url: &str) -> Result<(Option<u16>, Option<u16>), String> {
+    // 探针本身不该因为证书或代理问题失败得比被诊断的请求更早，
+    // 故沿用与插件下载同一套客户端构建方式（线上环境不放宽任何校验）
+    let client = build_http_client("online").map_err(|e| e.to_string())?;
+    let probe = |accept: Option<&'static str>| {
+        let client = client.clone();
+        let url = url.to_string();
+        async move {
+            let mut req = client.head(&url);
+            if let Some(a) = accept {
+                req = req.header(reqwest::header::ACCEPT, a);
+            }
+            req.send().await.ok().map(|r| r.status().as_u16())
+        }
+    };
+    let with_accept = probe(Some("application/octet-stream")).await;
+    let without_accept = probe(None).await;
+    Ok((with_accept, without_accept))
+}
+
+/// 尽力放行日志服务端口。
+///
+/// 详见 `build_firewall_rule_script_windows` 的文档：自动升级时更新器不是管理员，
+/// NSIS 安装钩子不会生效，所以客户端自己再试一次。**失败是常态**（非管理员），
+/// 失败原因照样记进日志 —— 那份日志在本机可读，人上机排查时能立刻看到症结。
+fn try_add_firewall_rule(port: u16) {
+    match try_add_firewall_rule_os(port) {
+        Ok(msg) => log_client_info(&format!("[启动] 防火墙放行 {} 端口成功: {}", port, msg)),
+        // INFO 而非 ERROR：非管理员运行时必然失败，记成异常会让「仅异常」视图
+        // 每次启动都多一条噪音，而这不是故障
+        Err(e) => log_client_info(&format!(
+            "[启动] 防火墙放行 {} 端口未成功（多为非管理员运行，需人工执行一次 netsh）: {}",
+            port, e
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn try_add_firewall_rule_os(port: u16) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // 规则同名时 netsh 会再加一条重复规则而不报错，故先删后加保持幂等
+    let script = format!(
+        "netsh advfirewall firewall delete rule name=\"aichat-updater\" >$null 2>&1; {}",
+        build_firewall_rule_script_windows(port)
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_add_firewall_rule_os(_port: u16) -> Result<String, String> {
+    // macOS/Linux 上开发调试用，不做防火墙改动：采购机全是 Windows，
+    // 在开发机上动系统防火墙没有收益、只有风险
+    Err("非 Windows 平台，跳过".to_string())
 }
 
 /// 获取开机自启偏好，供前端/托盘菜单回显开关状态
@@ -1047,6 +1412,11 @@ fn list_chrome_windows_os() -> Result<Vec<(u32, bool)>, String> {
 ///
 /// 本函数只负责「把判定结果落成实际动作」，判定逻辑全在 heartbeat 模块（可单测）
 fn spawn_heal_inspector(registry: std::sync::Arc<std::sync::Mutex<heartbeat::HeartbeatRegistry>>) {
+    // 自愈动作全部停用后，这些「需人工介入」的 ERROR 只是观测记录，却会把
+    // 「仅异常」视图淹掉：15 个实例 × 每个 30 分钟冷却期各 2 条 ≈ 90 条，
+    // 而真正要看的插件异常就混在里面。按插件+原因做时间窗抑制，
+    // 保证「一直失联就一直有记录」但频率降到每小时一条。
+    let mut throttle = LogThrottle::new(std::time::Duration::from_secs(3600));
     std::thread::spawn(move || loop {
         std::thread::sleep(HEAL_INSPECT_INTERVAL);
         let actions = match registry.lock() {
@@ -1081,16 +1451,28 @@ fn spawn_heal_inspector(registry: std::sync::Arc<std::sync::Mutex<heartbeat::Hea
                 // 通过（heartbeat 模块 + run_restart_chrome_os），确认收益大于风险
                 // 后接线即可，此处只记录以便观察真实发生频率
                 heartbeat::HealAction::RestartChrome => {
-                    log_client_error(&format!(
-                        "[自愈] {} 彻底失联（已达重启条件，但重启 Chrome 暂未启用），等待人工介入",
-                        plugin
-                    ));
+                    // 重启没真发生，所以这条只是观测记录 —— 用时间窗抑制，
+                    // 否则冷却期一到就再刷一轮，把真正的插件异常挤出视野
+                    if throttle.should_log(
+                        &format!("restart:{}", plugin),
+                        std::time::Instant::now(),
+                    ) {
+                        log_client_error(&format!(
+                            "[自愈] {} 彻底失联（已达重启条件，但重启 Chrome 暂未启用），等待人工介入",
+                            plugin
+                        ));
+                    }
                 }
                 heartbeat::HealAction::RestartSuppressed(reason) => {
-                    log_client_error(&format!(
-                        "[自愈] {} 彻底失联（{}），等待人工介入",
-                        plugin, reason
-                    ));
+                    if throttle.should_log(
+                        &format!("suppress:{}:{}", plugin, reason),
+                        std::time::Instant::now(),
+                    ) {
+                        log_client_error(&format!(
+                            "[自愈] {} 彻底失联（{}），等待人工介入",
+                            plugin, reason
+                        ));
+                    }
                 }
                 // 同一原因已上报过，不重复记录——巡检每 5 秒一轮，
                 // 不去重会让一台故障机一天攒出上千条相同日志
@@ -1421,8 +1803,27 @@ pub fn run() {
                 std::sync::Arc::new(log_file::FileSink::new(get_log_dir()));
             let _ = LOG_SINK.set(sink.clone());
             // 启动即记录自身版本：自更新失败是静默的（采购同事看到报错也无从处理），
-            // 没有这条日志就无法判断十几台机器里谁卡在旧版没升上来
-            log_client_info(&build_startup_version_line(&app_version));
+            // 没有这条日志就无法判断十几台机器里谁卡在旧版没升上来。
+            // 同时带上「升级前是哪版」，逐台核实 rollout 时才能区分升级与重启
+            let previous_version = load_and_record_version(
+                &get_config_file_path_with_dir(&get_app_config_dir()),
+                &app_version,
+            );
+            log_client_info(&build_startup_version_line(
+                &app_version,
+                previous_version.as_deref(),
+            ));
+            // 启动环境快照：排查时最常问的几个「它到底装在哪、认哪个更新源」
+            // 一次性给全，免得为了确认一个路径又要远程折腾一轮
+            let endpoint = extract_updater_endpoint(
+                &serde_json::to_value(&app.config().plugins).unwrap_or_default(),
+            );
+            log_client_info(&format!(
+                "[启动] machineId={} 更新源={} 日志目录={:?}",
+                get_machine_id(),
+                endpoint,
+                get_log_dir()
+            ));
             // 心跳状态表由 HTTP 服务与自愈巡检共享同一实例：
             // 巡检要读 HTTP 侧写入的 last_seen，也要往队列塞待下发指令
             let heartbeats = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1436,6 +1837,9 @@ pub fn run() {
             match log_server::spawn(sink, &app_version, heartbeats.clone(), ws_token) {
                 Ok(port) => {
                     LOG_SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+                    // 端口起来了才有放行的意义。放在这里而不是安装阶段，是因为
+                    // 自动升级时更新器不是管理员、NSIS 钩子不会跑（见函数文档）
+                    try_add_firewall_rule(port);
                     println!(
                         "日志服务已启动: http://127.0.0.1:{}，日志目录: {:?}",
                         port,
@@ -1469,6 +1873,10 @@ pub fn run() {
             get_log_server_port,
             log_self_update_error,
             log_self_update_info,
+            log_self_update_check,
+            log_self_update_failure,
+            log_self_update_progress,
+            diagnose_download_url,
             list_log_dates,
             read_log_entries,
             read_log_page,
@@ -1576,6 +1984,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     // 1. 配置文件路径
@@ -2327,7 +2736,7 @@ mod tests {
 
     #[test]
     fn test_build_startup_version_line_contains_version() {
-        let msg = build_startup_version_line("0.2.0");
+        let msg = build_startup_version_line("0.2.0", None);
         assert!(
             msg.contains("0.2.0"),
             "启动日志必须含版本号，否则无法判断十几台机器里谁卡在旧版：{}",
@@ -2469,5 +2878,271 @@ mod tests {
             "找不到磁盘时应给出 0 而非 panic，前端按 0 展示「未知」"
         );
         assert_eq!(snapshot.disk_available_bytes, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 自更新可观测性（DEV-122551 / DEV-122552）
+    //
+    // 这批日志是「升级前必须埋好」的：十几台采购机升一次成本很高，
+    // 升上去才发现少埋了字段，就得再付一次升级代价。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_throttle_allows_first_occurrence() {
+        let mut t = LogThrottle::new(Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(t.should_log("x", now), "首次出现必须放行，否则问题第一次发生就没记录");
+    }
+
+    #[test]
+    fn test_throttle_suppresses_within_window() {
+        let mut t = LogThrottle::new(Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(t.should_log("x", now));
+        assert!(
+            !t.should_log("x", now + Duration::from_secs(60)),
+            "窗口内重复应抑制，否则每 5 秒一轮的巡检会把异常视图刷满"
+        );
+    }
+
+    #[test]
+    fn test_throttle_allows_again_after_window() {
+        // 这是本结构存在的核心理由：旧写法是「同一错误只记一次，直到成功才解除」，
+        // 而持续失败（比如断网）时永远等不到成功 —— 第一条之后永久静默，
+        // 排查者看到没有日志会误判成「这台机器没问题」。
+        let mut t = LogThrottle::new(Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(t.should_log("x", now));
+        assert!(
+            t.should_log("x", now + Duration::from_secs(3601)),
+            "窗口过后必须再放行：一直坏就要一直有记录，只是频率被压下来"
+        );
+    }
+
+    #[test]
+    fn test_throttle_keys_are_independent() {
+        let mut t = LogThrottle::new(Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(t.should_log("a", now));
+        assert!(
+            t.should_log("b", now),
+            "不同 key 互不影响，否则一个插件的故障会掩盖另一个的"
+        );
+    }
+
+    #[test]
+    fn test_check_line_records_both_versions_and_verdict() {
+        // 成功时也要记 —— 现在成功路径什么都不写，导致「这台机器还在检查更新吗」
+        // 根本判断不了：定时器死了和一切正常在日志里长得一模一样。
+        // 有了这条，4 小时一次的节律本身就是心跳。
+        let line = build_self_update_check_line("0.3.1", "0.3.1", "已是最新", 412);
+        assert!(line.contains("当前=0.3.1"), "必须带当前版本，否则不知道这台跑的是哪版");
+        assert!(line.contains("远端=0.3.1"), "必须带远端版本，否则不知道它在跟什么比");
+        assert!(line.contains("已是最新"));
+        assert!(line.contains("412ms"), "耗时用于识别「能连上但很慢」");
+        assert!(
+            line.contains("[自更新]"),
+            "统一前缀，便于用 --keyword 一次筛出整条自更新链路"
+        );
+    }
+
+    #[test]
+    fn test_failure_line_carries_url_and_detail() {
+        // 2026-08-24 那个 500 只记了一句 message，定位根因靠反复 curl 才做到。
+        // 把地址和详情落进日志，下次一眼就完。
+        let line = build_self_update_failure_line(
+            "下载",
+            "https://x/a%20b.exe",
+            "状态=500 响应体=<html>...nginx",
+            287,
+        );
+        assert!(line.contains("下载失败"));
+        assert!(line.contains("https://x/a%20b.exe"), "必须带下载地址：指错环境时靠它发现");
+        assert!(line.contains("状态=500"));
+        assert!(line.contains("287ms"));
+    }
+
+    #[test]
+    fn test_progress_line_shows_human_readable_size_and_speed() {
+        // 现在只在下载完成后记一次总量，所以「卡住」（不是失败、就是慢）看不出来
+        let line = build_download_progress_line(1_100_000, 4_341_507, 400);
+        assert!(line.contains("25%"), "百分比让人一眼看出卡在哪个阶段");
+        assert!(line.contains("MB"), "字节数要人类可读，采购机日志也可能被人直接看");
+        assert!(line.contains("/s"), "速度用于区分「断了」和「很慢」");
+    }
+
+    #[test]
+    fn test_progress_line_handles_unknown_total() {
+        // Content-Length 缺失时 total 为 0，不能除零 panic
+        let line = build_download_progress_line(1024, 0, 100);
+        assert!(
+            !line.contains("%"),
+            "总量未知时不应给出百分比，否则显示一个凭空算出来的假进度"
+        );
+    }
+
+    #[test]
+    fn test_startup_line_distinguishes_upgrade_from_restart() {
+        // 这是验证 rollout 的关键一条：要能区分「这台完成了升级」和「这台只是重启了」。
+        // 否则十几台机器逐台核实时，看到「启动，版本 0.3.1」无法判断它是刚升上来的
+        // 还是本来就是 0.3.1。
+        let upgraded = build_startup_version_line("0.3.1", Some("0.3.0"));
+        assert!(
+            upgraded.contains("0.3.0"),
+            "版本变化时必须带上一版本，这是判断升级成功与否的唯一依据"
+        );
+
+        let restarted = build_startup_version_line("0.3.1", Some("0.3.1"));
+        assert!(
+            !restarted.contains("升级前"),
+            "版本没变说明只是重启，不该报成升级，否则核实 rollout 时全是假阳性"
+        );
+
+        let first_run = build_startup_version_line("0.3.1", None);
+        assert!(
+            first_run.contains("0.3.1"),
+            "首次安装无历史记录时仍要记版本"
+        );
+        assert!(
+            upgraded.contains("客户端启动") && first_run.contains("客户端启动"),
+            "前缀保持不变，既有按关键词筛版本分布的用法不能被破坏"
+        );
+    }
+
+    #[test]
+    fn test_record_version_returns_previous_and_persists_current() {
+        let tmp = tempfile::tempdir().expect("创建临时目录");
+        let cfg = tmp.path().join("config.json");
+
+        assert_eq!(
+            load_and_record_version(&cfg, "0.3.0"),
+            None,
+            "首次调用没有历史版本，应返回 None 而非空串（空串会被误判成「上一版本是空」）"
+        );
+        assert_eq!(
+            load_and_record_version(&cfg, "0.3.1"),
+            Some("0.3.0".to_string()),
+            "第二次调用应拿到上次记录的版本，这样启动日志才能说出「升级前是哪版」"
+        );
+    }
+
+    #[test]
+    fn test_record_version_preserves_other_config_fields() {
+        // config.json 里还有安装路径与 machine_id。写版本号时抹掉它们，
+        // 后果是用户自定义的安装路径丢失、machine_id 重新生成（等于换了台新机器，
+        // 历史日志全部对不上）。
+        let tmp = tempfile::tempdir().expect("创建临时目录");
+        let cfg = tmp.path().join("config.json");
+        fs::write(
+            &cfg,
+            r#"{"online_path":"D:\\aichat","machine_id":"WIN-A-1234abcd","别的程序写的":"保留"}"#,
+        )
+        .expect("写入初始配置");
+
+        load_and_record_version(&cfg, "0.3.1");
+
+        let text = fs::read_to_string(&cfg).expect("读回配置");
+        assert!(text.contains("D:"), "自定义安装路径必须保留");
+        assert!(text.contains("WIN-A-1234abcd"), "machine_id 必须保留");
+        assert!(text.contains("别的程序写的"), "未声明字段必须透传（serde flatten 的作用）");
+    }
+
+    #[test]
+    fn test_diagnosis_identifies_accept_header_rejection() {
+        // 这是 2026-08-24 那个根因的机器可读版本：同一地址，带 Accept 500、不带 200。
+        // 埋这条的价值是让下一次同类问题在日志里自己说出结论，不用人去 curl 对比。
+        let v = build_diagnosis_verdict(Some(500), Some(200));
+        assert!(
+            v.contains("Accept"),
+            "带头失败、不带头成功 ⇒ 必须指向请求头，而不是让人误以为是网络故障"
+        );
+    }
+
+    #[test]
+    fn test_diagnosis_identifies_network_failure() {
+        let v = build_diagnosis_verdict(None, None);
+        assert!(
+            v.contains("网络") || v.contains("DNS"),
+            "两种请求都发不出去 ⇒ 指向网络/DNS，不该误报成服务端问题"
+        );
+    }
+
+    #[test]
+    fn test_diagnosis_reports_transient_when_probe_succeeds() {
+        // 下载失败了，但诊断时同样的请求又成功了 —— 这种要明确说成瞬时，
+        // 否则排查者会因为「我手动试是好的」而怀疑日志在骗人
+        let v = build_diagnosis_verdict(Some(200), Some(200));
+        assert!(v.contains("瞬时"), "诊断时正常应明确报瞬时故障，避免与手动复现结果矛盾");
+    }
+
+    /// 对**真实服务端**验证探针能得出正确结论。默认不跑（要联网）：
+    /// `cargo test -- --ignored probe_real_server`
+    ///
+    /// 存在理由：`build_diagnosis_verdict` 的单测只证明「给定两个状态码时结论对」，
+    /// 不证明「服务端真的会这么回」。而这次故障的全部要害就在服务端的实际行为上，
+    /// 那部分只有打一次真实请求才算证实。这条同时充当**回归哨兵** ——
+    /// 运维把 nginx 修好之后它会失败，正好提示可以把下载地址切回自建站。
+    #[test]
+    #[ignore = "需要联网访问 chainai 站点"]
+    fn test_probe_real_server_detects_accept_rejection() {
+        let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime");
+        let (with_accept, without_accept) = rt
+            .block_on(probe_download_url(
+                "https://chainai.cjdropshipping.cn/updater/latest.json",
+            ))
+            .expect("探针应能创建 HTTP 客户端");
+        let verdict = build_diagnosis_verdict(with_accept, without_accept);
+        println!("带 Accept={:?} 不带={:?} ⇒ {}", with_accept, without_accept, verdict);
+        assert_eq!(
+            with_accept,
+            Some(500),
+            "2026-08-24 实测：该站点对 Accept: application/octet-stream 整站返回 500。\
+             若此断言失败，说明服务端已修好，可以把 latest.json 的下载地址切回自建站"
+        );
+        assert_eq!(
+            without_accept,
+            Some(200),
+            "同一地址不带 Accept 应返回 200——这个对比正是根因判定的依据"
+        );
+    }
+
+    #[test]
+    fn test_extract_updater_endpoint_reads_first_configured_url() {
+        // 从真实配置里取而不是另抄一份常量：抄的那份迟早和 tauri.conf.json 不一致，
+        // 而「日志说的地址」与「实际请求的地址」不同会把排查带偏很久
+        let plugins = serde_json::json!({
+            "updater": { "endpoints": ["https://x/updater/latest.json"] }
+        });
+        assert_eq!(
+            extract_updater_endpoint(&plugins),
+            "https://x/updater/latest.json"
+        );
+    }
+
+    #[test]
+    fn test_extract_updater_endpoint_tolerates_missing_config() {
+        // 读不到配置只是日志里少一个字段，不该 panic 拖垮启动
+        assert_eq!(
+            extract_updater_endpoint(&serde_json::json!({})),
+            "未配置"
+        );
+        assert_eq!(
+            extract_updater_endpoint(&serde_json::json!({"updater": {}})),
+            "未配置"
+        );
+    }
+
+    #[test]
+    fn test_firewall_script_targets_given_port_only() {
+        let script = build_firewall_rule_script_windows(17653);
+        assert!(script.contains("17653"), "必须放行实际使用的端口");
+        assert!(
+            script.contains("dir=in"),
+            "只放行入站：出站本来就不受限，多加规则等于扩大暴露面"
+        );
+        assert!(
+            !script.contains("dir=out"),
+            "不应放行出站，避免超出「让 AI 读日志」这一必要范围"
+        );
     }
 }
