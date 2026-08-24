@@ -598,11 +598,20 @@ mod tests {
 
     #[test]
     fn test_bind_listener_probes_next_port_when_occupied() {
-        let first = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT));
-        // 若首端口本就被外部占用则跳过，避免误报
-        if first.is_err() {
-            return;
-        }
+        // 占位必须绑 bind_listener 用的同一个地址（0.0.0.0）。
+        //
+        // 原先占的是 127.0.0.1:17653，而 bind_listener 绑 0.0.0.0:17653 ——
+        // macOS 允许这两者共存，于是「首端口已被占用」这个前提从未成立：
+        // bind_listener 照样拿到 17653，断言必然失败。而它在全量测试里能过，
+        // 只是因为并行跑的别的测试恰好先占了端口、命中了下面那条早退路径。
+        // 也就是说这条测试长期处于「要么空转、要么失败」的状态，从没真正验证过
+        // 端口探测逻辑（2026-08-24 加了一个无关测试改变并行顺序后暴露）。
+        let occupied = std::net::TcpListener::bind(("0.0.0.0", DEFAULT_PORT));
+        // 首端口被本机其它进程（如正在运行的客户端）占用时跳过，避免误报
+        let _guard = match occupied {
+            Ok(l) => l,
+            Err(_) => return,
+        };
         let second = bind_listener().expect("首端口被占用时应探测到下一个可用端口");
         assert_ne!(
             second.local_addr().expect("读取地址失败").port(),

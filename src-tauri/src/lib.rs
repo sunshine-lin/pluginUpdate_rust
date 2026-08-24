@@ -902,15 +902,22 @@ impl LogThrottle {
 /// 原先只在失败时写日志，于是「这台机器还在检查更新吗」根本判断不了：
 /// 定时器死了、进程僵住、和一切正常，在日志里长得一模一样（都是没有日志）。
 /// 每 4 小时一条的节律本身就是心跳 —— 超过一个周期没有这条，就是客户端出问题了。
+/// `trigger` 区分「定时轮询」与「用户点了按钮」。
+///
+/// # 为什么这个字段不能省
+/// 这条日志被当作 4 小时一次的存活心跳用 —— 而 2026-08-24 在真机上一次
+/// 连点「检查更新」就刷了 10 条，全都长得一模一样。分不清来源的话，
+/// 一串手动点击会把节律搞乱，「这台还活着吗」的判断就不准了。
 pub fn build_self_update_check_line(
+    trigger: &str,
     current: &str,
     remote: &str,
     verdict: &str,
     elapsed_ms: u128,
 ) -> String {
     format!(
-        "[自更新] 检查完成 当前={} 远端={} 结论={} 耗时={}ms",
-        current, remote, verdict, elapsed_ms
+        "[自更新] 检查完成 触发={} 当前={} 远端={} 结论={} 耗时={}ms",
+        trigger, current, remote, verdict, elapsed_ms
     )
 }
 
@@ -1070,8 +1077,15 @@ fn log_self_update_info(message: String) {
 /// 见 `build_self_update_check_line` 的文档：这条同时充当客户端存活心跳，
 /// 没有它就无法区分「定时器死了」和「一切正常」。
 #[tauri::command]
-fn log_self_update_check(current: String, remote: String, verdict: String, elapsed_ms: u64) {
+fn log_self_update_check(
+    trigger: String,
+    current: String,
+    remote: String,
+    verdict: String,
+    elapsed_ms: u64,
+) {
     log_client_info(&build_self_update_check_line(
+        &trigger,
         &current,
         &remote,
         &verdict,
@@ -1178,10 +1192,45 @@ fn try_add_firewall_rule_os(port: u16) -> Result<String, String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| e.to_string())?;
+    let detail = describe_command_output(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    );
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(detail)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(detail)
+    }
+}
+
+/// 把命令执行结果汇总成一句可读说明。
+///
+/// # 为什么不能只取 stderr
+/// 2026-08-24 在真机（DESKTOP-MQUBUQS）实测：netsh 失败时这条日志的冒号后面
+/// **是空的** —— 因为 netsh 把「拒绝访问」之类的说明写到 **stdout** 而不是
+/// stderr，只取 stderr 就得到空串。结果这条日志只能说明「失败了」，
+/// 说不出为什么，而它恰恰是防火墙盲区的唯一仪表：端口不通就读不到日志，
+/// 读不到日志就无法确认那台机器升没升。
+///
+/// 所以 stdout / stderr / 退出码三者都带上，并在全空时明说「无输出」，
+/// 而不是留一个让人以为日志被截断了的空白。
+pub fn describe_command_output(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let mut parts = Vec::new();
+    let out = stdout.trim();
+    let err = stderr.trim();
+    if !out.is_empty() {
+        parts.push(format!("stdout={}", out));
+    }
+    if !err.is_empty() {
+        parts.push(format!("stderr={}", err));
+    }
+    if parts.is_empty() {
+        parts.push("无输出".to_string());
+    }
+    match code {
+        Some(c) => format!("退出码={} {}", c, parts.join(" ")),
+        None => format!("退出码=未知(被信号终止) {}", parts.join(" ")),
     }
 }
 
@@ -2935,7 +2984,7 @@ mod tests {
         // 成功时也要记 —— 现在成功路径什么都不写，导致「这台机器还在检查更新吗」
         // 根本判断不了：定时器死了和一切正常在日志里长得一模一样。
         // 有了这条，4 小时一次的节律本身就是心跳。
-        let line = build_self_update_check_line("0.3.1", "0.3.1", "已是最新", 412);
+        let line = build_self_update_check_line("auto", "0.3.1", "0.3.1", "已是最新", 412);
         assert!(line.contains("当前=0.3.1"), "必须带当前版本，否则不知道这台跑的是哪版");
         assert!(line.contains("远端=0.3.1"), "必须带远端版本，否则不知道它在跟什么比");
         assert!(line.contains("已是最新"));
@@ -2944,6 +2993,29 @@ mod tests {
             line.contains("[自更新]"),
             "统一前缀，便于用 --keyword 一次筛出整条自更新链路"
         );
+        assert!(
+            line.contains("触发=auto"),
+            "必须区分定时轮询与手动点击：这条当心跳用，2026-08-24 真机上一次连点\
+             就刷了 10 条一模一样的，混在一起会让节律判断失效"
+        );
+    }
+
+    #[test]
+    fn test_command_output_never_leaves_empty_detail() {
+        // 2026-08-24 真机实测：netsh 失败时日志冒号后面是空的——它把说明写到
+        // stdout 而非 stderr。这条日志是防火墙盲区的唯一仪表，空白等于没仪表
+        let both_empty = describe_command_output(Some(1), "", "");
+        assert!(both_empty.contains("无输出"), "全空时要明说，而不是留一段让人以为被截断的空白");
+        assert!(both_empty.contains("退出码=1"), "退出码本身就是信息，必须带上");
+
+        let only_stdout = describe_command_output(Some(1), "拒绝访问。", "");
+        assert!(
+            only_stdout.contains("拒绝访问"),
+            "只取 stderr 就会丢掉 netsh 写在 stdout 里的真正原因"
+        );
+
+        let killed = describe_command_output(None, "", "");
+        assert!(killed.contains("未知"), "被信号终止时也要给出可读说明，不能是空的");
     }
 
     #[test]

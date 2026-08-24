@@ -264,6 +264,7 @@ function App() {
         // 于是每次启动的第一条日志都会记成「当前=未知」，恰好是最想知道版本的时刻
         const current = await getVersion().catch(() => "未知");
         invoke("log_self_update_check", {
+          trigger,
           current,
           remote: current, // check() 返回 null ⇒ 远端不比本地新
           verdict: "已是最新",
@@ -274,6 +275,7 @@ function App() {
       }
       downloadUrl = resolveDownloadUrl(update.rawJson);
       invoke("log_self_update_check", {
+        trigger,
         current: update.currentVersion,
         remote: update.version,
         verdict: "发现新版",
@@ -350,6 +352,7 @@ function App() {
         // 正是 2026-08-24 那次栽跟头的方式
         if (shouldLogSelfUpdateError(msg)) {
           invoke("log_self_update_check", {
+            trigger,
             current: await getVersion().catch(() => "未知"),
             remote: "未知",
             verdict: "清单无本平台包（只发布 Windows 包时属正常）",
