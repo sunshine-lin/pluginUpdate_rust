@@ -243,11 +243,17 @@ impl HeartbeatRegistry {
             state.actual_account = req.actual_account.clone();
         }
 
-        // 消费 ack：插件已执行完的指令出队
+        // 收到心跳即说明插件活着，解除失联抑制标记。
+        //
+        // 原先只在收到 ack 时才清除，那是「自动下发 reload」年代的写法：
+        // 插件 ack 了才算真重载过。停掉自动下发后（2026-08-24）永远收不到 ack，
+        // 标记会永久生效——同一台机器只会上报一次失联、之后再也不报，
+        // 反复出问题的机器在日志里只留得下最早那一条。
+        state.reload_issued = false;
+
+        // 消费 ack：插件已执行完的指令出队（手动下发的指令仍走这条路）
         if !req.acked.is_empty() {
             state.pending.retain(|c| !req.acked.contains(&c.id));
-            // reload 被 ack 说明插件确实重载过了，解除抑制
-            state.reload_issued = false;
         }
 
         HeartbeatResponse {
@@ -402,29 +408,34 @@ impl HeartbeatRegistry {
         // 已脱离二级区间：清除抑制记录，下次真的失联时能重新上报
         state.last_suppress_reason = None;
 
-        // 一级：疑似半死，下发 reload 让插件自己重载。
+        // 一级：疑似半死。**本期只上报、不自动下发 reload**（2026-08-24）。
         //
-        // # 为什么这里不判 sidepanel_open
-        // reload 会连带销毁侧边栏、而侧边栏无法由代码重开，故插件侧加了
-        // 「侧边栏还开着就拒绝执行 reload」的守卫。判断放在**插件侧**而非
-        // 这里，是因为触发本分支的前提正是「心跳已超时」——此时手上的
-        // sidepanel_open 是至少 20 秒前的旧值，据它决策等于拿过期数据下判断。
-        // 插件真收到指令时在本地复检一次才准。
+        // # 为什么停掉自动下发
+        // 本期范围收窄为「只把日志链路跑通」，客户端不做任何自愈操作。而线上
+        // 插件（release 分支）根本没有指令处理代码——它连 heartbeat.ts 都没有，
+        // 那些改动全在 feat/client-heartbeat-selfheal 分支上、从未上线。
         //
-        // # ack 对 reload 无效
-        // 插件执行 reload 会销毁自己的 Service Worker，连带销毁待 ack 队列，
-        // 那条 cmd id 永远发不回来。故防重复完全依赖下面的 reload_issued 标志，
-        // 不能指望 ack 出队（新增重启型指令时同理）。
+        // 若这里照旧入队，指令会发给一个不会处理它的插件：未知类型被忽略、
+        // 永远收不到 ack，队列里的 Command 就一直堆着，每次心跳都白传一遍。
+        //
+        // # 恢复条件
+        // 插件侧的指令处理合入 release 之后，把下面注释掉的入队逻辑放回来即可。
+        // 届时仍要注意两点（原分析保留，避免后人重踩）：
+        // - **不在这里判 sidepanel_open**：触发本分支的前提是「心跳已超时」，
+        //   手上的 sidepanel_open 是至少 20 秒前的旧值，据它决策等于拿过期数据
+        //   下判断。插件真收到指令时在本地复检一次才准（插件侧已有该守卫）。
+        // - **ack 对 reload 无效**：插件执行 reload 会销毁自己的 Service Worker、
+        //   连带销毁待 ack 队列，那条 cmd id 永远发不回来。防重复只能靠
+        //   reload_issued 标志，不能指望 ack 出队。
         if silence >= RELOAD_THRESHOLD {
             if state.reload_issued {
                 return HealAction::None;
             }
             state.reload_issued = true;
-            state.pending.push(Command {
-                id: format!("cmd-{}", seq),
-                kind: "reload".to_string(),
-            });
-            self.seq += 1;
+            // 暂不入队，仅上报供观察真实发生频率：
+            // state.pending.push(Command { id: format!("cmd-{}", seq), kind: "reload".into() });
+            // self.seq += 1;
+            let _ = seq;
             return HealAction::IssueReload;
         }
 
@@ -664,16 +675,25 @@ mod tests {
     }
 
     #[test]
-    fn test_reload_command_is_delivered_on_next_heartbeat() {
+    fn test_reload_is_reported_but_not_auto_issued() {
+        // 本期（2026-08-24）只上报、不自动下发：线上插件没有指令处理代码，
+        // 发过去只会被忽略且永远收不到 ack，指令在队列里一直堆着白传
         let mut reg = HeartbeatRegistry::new();
         let t0 = Instant::now();
         reg.on_heartbeat(&req("robot-01", true, vec![]), t0);
-        reg.inspect(t0 + RELOAD_THRESHOLD);
 
-        // 插件恢复心跳时应取到那条 reload
+        let actions = reg.inspect(t0 + RELOAD_THRESHOLD);
+        assert_eq!(
+            actions[0].1,
+            HealAction::IssueReload,
+            "仍应上报，供观察真实发生频率"
+        );
+
         let resp = reg.on_heartbeat(&req("robot-01", true, vec![]), t0 + RELOAD_THRESHOLD);
-        assert_eq!(resp.commands.len(), 1, "待下发指令应在下次心跳时捎回");
-        assert_eq!(resp.commands[0].kind, "reload");
+        assert!(
+            resp.commands.is_empty(),
+            "不得自动下发 reload——插件侧的指令处理尚未合入 release"
+        );
     }
 
     #[test]
@@ -681,7 +701,9 @@ mod tests {
         let mut reg = HeartbeatRegistry::new();
         let t0 = Instant::now();
         reg.on_heartbeat(&req("robot-01", true, vec![]), t0);
-        reg.inspect(t0 + RELOAD_THRESHOLD);
+        // 用手动下发造数据：巡检已不再自动入队（见 decide 的一级分支）
+        reg.enqueue_command("robot-01", "reconnectWs")
+            .expect("手动下发应成功");
         let resp = reg.on_heartbeat(&req("robot-01", true, vec![]), t0 + RELOAD_THRESHOLD);
         let cmd_id = resp.commands[0].id.clone();
 
@@ -837,19 +859,27 @@ mod tests {
         let mut reg = HeartbeatRegistry::new();
         let t0 = Instant::now();
         reg.on_heartbeat(&req("robot-01", true, vec![]), t0);
-        reg.inspect(t0 + RELOAD_THRESHOLD);
+        // 第一次超时：上报一次（reload_issued 置位，抑制后续重复上报）
+        assert_eq!(
+            reg.inspect(t0 + RELOAD_THRESHOLD)[0].1,
+            HealAction::IssueReload
+        );
+        assert_eq!(
+            reg.inspect(t0 + RELOAD_THRESHOLD + Duration::from_secs(5))[0].1,
+            HealAction::None,
+            "同一次失联期间不应重复上报"
+        );
 
-        // 插件恢复并 ack，随后再次失联，应能重新下发 reload
-        let resp = reg.on_heartbeat(&req("robot-01", true, vec![]), t0 + RELOAD_THRESHOLD);
-        let id = resp.commands[0].id.clone();
-        let t1 = t0 + RELOAD_THRESHOLD + Duration::from_secs(1);
-        reg.on_heartbeat(&req("robot-01", true, vec![id]), t1);
+        // 插件恢复心跳后再次失联，应能重新上报——否则抑制标记会永久生效，
+        // 一台机器反复出问题只会在日志里留下最早那一条
+        let t1 = t0 + RELOAD_THRESHOLD + Duration::from_secs(10);
+        reg.on_heartbeat(&req("robot-01", true, vec![]), t1);
 
         let actions = reg.inspect(t1 + RELOAD_THRESHOLD);
         assert_eq!(
             actions[0].1,
             HealAction::IssueReload,
-            "恢复过一次后再失联必须能再次下发 reload，否则抑制标记会永久生效"
+            "恢复过一次后再失联必须能重新上报，否则抑制标记会永久生效"
         );
     }
 

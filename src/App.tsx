@@ -153,8 +153,6 @@ function App() {
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
-  // 手动打开插件侧边栏的结果提示（自愈流程会自动调，这里供排查时手动触发）
-  const [sidepanelHint, setSidepanelHint] = useState<string>("");
 
   // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
   const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
@@ -379,21 +377,12 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
-  /// 给某个实例下发重连 WS 指令。
-  /// 走心跳通道（路径 A）——天然定向到该实例、不抢焦点、无手势要求，
-  /// 是当前唯一能真正闭环的自愈手段
-  async function handleReconnectWs(pluginName: string) {
-    setPatrolHint(`正在向 ${pluginName} 下发重连指令…`);
-    try {
-      const result = await invoke<string>("send_plugin_command", {
-        pluginName,
-        kind: "reconnectWs",
-      });
-      setPatrolHint(result);
-    } catch (e) {
-      setPatrolHint(`下发失败: ${e}`);
-    }
-  }
+  // 「重连 WS」按钮已于 2026-08-24 移除：本期范围收窄为「只把日志链路跑通」，
+  // 客户端不做任何自愈操作。而线上插件（release 分支）根本没有指令处理代码，
+  // 下发过去只会被忽略、永远收不到 ack，指令在队列里一直堆着白传。
+  // 插件侧的指令处理合入 release 后再恢复。
+
+
 
   // 机器状态：常驻定时刷新（不只在「机器状态」页才采样），
   // 供标题栏简化指示器随时显示，无需切到该页才能看到负载情况
@@ -533,22 +522,6 @@ function App() {
   }
 
   /** 更新完成后自动刷新所有 Chrome 标签页 */
-  /// 手动触发打开插件侧边栏。
-  ///
-  /// ⚠️ 会抢占全局焦点：实现是切换窗口 + 模拟 Ctrl+Shift+L 按键，而一台机器
-  /// 跑着 3~15 个 Chrome 实例、插件正往供应商聊天框输入文字——抢焦点会打断
-  /// 其中正在输入的那个，按键可能落进聊天框污染发出去的内容。
-  /// 故自愈流程已不再自动调用（2026-08-21 止血），仅保留此人工入口。
-  async function handleOpenSidepanel() {
-    setSidepanelHint("正在打开侧边栏…");
-    try {
-      const result = await invoke<string>("open_plugin_sidepanel");
-      setSidepanelHint(result);
-    } catch (e) {
-      setSidepanelHint(`打开侧边栏失败: ${e}`);
-    }
-  }
-
   async function postUpdateChromeActions() {
     try {
       const refreshResult = await invoke<string>("refresh_chrome_tabs");
@@ -826,7 +799,6 @@ function App() {
                     <th>1688</th>
                     <th>账号</th>
                     <th>任务</th>
-                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -866,18 +838,6 @@ function App() {
                           : (it.actualAccount ?? "—")}
                       </td>
                       <td>{it.taskRunning ? "运行中" : "空闲"}</td>
-                      <td>
-                        {/* 重连走心跳通道，定向到该实例、不抢焦点。
-                            插件已失联时取不走指令，故禁用按钮 */}
-                        <button
-                          className="btn-secondary btn-mini"
-                          disabled={it.stale}
-                          title={it.stale ? "实例已失联，取不走指令" : "下发重连 WS 指令"}
-                          onClick={() => handleReconnectWs(it.pluginName)}
-                        >
-                          重连 WS
-                        </button>
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -920,20 +880,17 @@ function App() {
           ) : (
             <p className="machine-status-loading">正在获取机器状态…</p>
           )}
-          {/* 插件侧边栏必须常驻打开才能处理任务。但拉起要抢全局焦点+模拟按键，
-              会打断正在往供应商聊天框输入文字的实例，故不再自动触发，
-              只保留手动入口并明确提示风险 */}
-          <div className="machine-status-actions">
-            <button className="btn-secondary" onClick={handleOpenSidepanel}>
-              打开插件侧边栏
-            </button>
-            <span className="machine-status-warn">
-              会切换窗口并模拟按键，可能打断插件正在进行的输入，请确认当前无任务在跑再点
-            </span>
-            {sidepanelHint && (
-              <span className="machine-status-hint">{sidepanelHint}</span>
-            )}
-          </div>
+          {/* 「打开插件侧边栏」按钮已于 2026-08-24 移除。
+              它是客户端里最后一个会抢全局焦点的入口：实现只能靠
+              AppActivate + SendKeys 模拟按键，而焦点是全局唯一资源——
+              一台机器跑 3~15 个 Chrome 实例、插件正通过它们往供应商聊天框
+              输入文字，抢一次焦点就会打断其中正在输入的那个（不限于目标实例），
+              按键可能落进聊天框造成乱字符或丢字，污染发给供应商的内容。
+
+              保留它原本的理由是「人工排查时确认快捷键链路是否通」，但该链路
+              已确认不用（Chrome 强制 sidePanel.open() 由用户手势触发，
+              自动拉起整条路走不通）。采购机无人值守，也没人需要点它。
+              真要人工开侧边栏，远程桌面进去按 Ctrl+Shift+L 即可。 */}
         </div>
       ) : (
         <>

@@ -492,7 +492,12 @@ pub fn build_open_sidepanel_script_macos() -> String {
         .to_string()
 }
 
-/// 执行平台相关的「打开插件侧边栏」命令
+/// 执行平台相关的「打开插件侧边栏」命令。
+///
+/// **已无调用方**（2026-08-24 移除了唯一入口）：它必须先 AppActivate 抢全局
+/// 焦点才能 SendKeys，会打断那台机器上正在往供应商聊天框输入的实例。
+/// 保留代码与测试是为了记录「为什么这条路走不通」，避免后人重新踩一遍。
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 fn run_open_sidepanel_os() -> Result<String, String> {
     let script = build_open_sidepanel_script_macos();
@@ -572,7 +577,11 @@ pub fn build_restart_chrome_script_macos() -> String {
         .to_string()
 }
 
-/// 执行平台相关的「重启 Chrome」命令
+/// 执行平台相关的「重启 Chrome」命令。
+///
+/// **已无调用方**：二级自愈从未接线（多开 15 个实例时重启会把全部干掉，
+/// 见 DEV-124837），且其配套的开侧边栏动作会抢焦点。
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 fn run_restart_chrome_os() -> Result<String, String> {
     let script = build_restart_chrome_script_macos();
@@ -907,20 +916,16 @@ fn refresh_chrome_tabs() -> Result<String, String> {
     run_refresh_chrome_tabs_os()
 }
 
-/// 打开 AIChat 插件侧边栏（模拟按下插件注册的 Ctrl+Shift+L 快捷键）。
-///
-/// # ⚠️ 会抢占全局焦点，仅供人工按需触发
-/// 实现是「AppActivate 抢焦点 + SendKeys 发按键」，而焦点是**全局唯一**资源：
-/// 一台机器跑着 3~15 个 Chrome 实例，插件正通过它们往供应商聊天框输入文字。
-/// 抢焦点会打断其中正在输入的那个实例（不限于目标实例），按键可能落进聊天
-/// 输入框造成乱字符或丢字——那是发给供应商的内容被污染。
-///
-/// 故**不得**由自愈流程或任何定时任务自动调用（2026-08-21 已从巡检里摘除）。
-/// 保留此命令只为人工排查：使用者知道自己在干什么、且能确认此刻无人在输入。
-#[tauri::command]
-fn open_plugin_sidepanel() -> Result<String, String> {
-    run_open_sidepanel_os()
-}
+// 「打开插件侧边栏」命令已于 2026-08-24 移除（连同前端按钮）。
+// 它是客户端里最后一个会抢全局焦点的入口——实现只能靠 AppActivate + SendKeys，
+// 而焦点是全局唯一资源：一台机器跑 3~15 个 Chrome 实例、插件正通过它们往供应商
+// 聊天框输入文字，抢一次焦点就会打断其中正在输入的那个（不限于目标实例），
+// 按键可能落进聊天框造成乱字符或丢字，污染发给供应商的内容。
+//
+// 下面的 build_open_sidepanel_* / run_open_sidepanel_os 保留但已无调用方：
+// 它们记录了「为什么这条路走不通」（Chrome 强制 sidePanel.open() 由用户手势
+// 触发，模拟按键是唯一途径而它必须抢焦点），有测试守着这些约束，删掉会让后人
+// 重新踩一遍。要恢复该能力，必须先解决抢焦点问题。
 
 // ─────────────────────────────────────────────────────────────────
 // 巡检看板（DEV-125034）
@@ -991,28 +996,14 @@ fn get_patrol_report() -> Result<PatrolReport, String> {
     })
 }
 
-/// 给指定实例下发一条指令（当前用于重连 WS）。
-///
-/// 走「路径 A」——指令通过心跳响应捎给发心跳的那个实例，天然定向、
-/// 不抢焦点、无手势要求。这是当前唯一能真正闭环的自愈手段：侧边栏仍
-/// 开着，重连后立刻可继续干活（不像 reload 会连带打掉侧边栏）
-#[tauri::command]
-fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
-    // 只允许已知的安全指令，避免前端传入任意字符串
-    const ALLOWED: [&str; 1] = ["reconnectWs"];
-    if !ALLOWED.contains(&kind.as_str()) {
-        return Err(format!("不支持的指令类型: {}", kind));
-    }
-    let reg = HEARTBEATS.get().ok_or("心跳服务未启动")?;
-    let mut guard = reg.lock().map_err(|_| "心跳状态表不可用".to_string())?;
-    match guard.enqueue_command(&plugin_name, &kind) {
-        Some(_) => {
-            log_client_info(&format!("[巡检] 已向 {} 下发 {} 指令", plugin_name, kind));
-            Ok(format!("已下发，等待 {} 执行", plugin_name))
-        }
-        None => Ok("该指令已在队列中，或实例未上报过心跳".to_string()),
-    }
-}
+// 「下发指令」命令已于 2026-08-24 移除（连同巡检页的「重连 WS」按钮）。
+// 本期范围收窄为「只把日志链路跑通」，客户端不做任何自愈操作；而线上插件
+// （release 分支）根本没有指令处理代码——heartbeat.ts 那批改动全在
+// feat/client-heartbeat-selfheal 分支上、从未上线。下发过去只会被忽略、
+// 永远收不到 ack，指令在队列里一直堆着，每次心跳都白传一遍。
+//
+// HeartbeatRegistry::enqueue_command 保留（含去重与未知实例拒绝的测试），
+// 插件侧指令处理合入 release 后重新接线即可。
 
 /// 枚举 Chrome 窗口及最小化状态
 #[cfg(target_os = "windows")]
@@ -1109,20 +1100,9 @@ fn spawn_heal_inspector(registry: std::sync::Arc<std::sync::Mutex<heartbeat::Hea
     });
 }
 
-/// 重启 Chrome 并把插件侧边栏拉起来（二级自愈的完整动作）。
-///
-/// 两步必须连在一起：只重启浏览器的话，插件虽然重新加载了，但
-/// sidepanel 不会自动打开——而插件设计上要求 sidepanel 常驻才能处理任务，
-/// 等于自愈只做了一半。等待时间给 Chrome 启动与插件初始化留余量
-#[tauri::command]
-fn restart_chrome_and_open_sidepanel() -> Result<String, String> {
-    let restart = run_restart_chrome_os()?;
-    // Chrome 冷启动 + 插件 Service Worker 初始化需要时间，
-    // 过早发快捷键会因插件尚未注册 command 监听而丢失
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let sidepanel = run_open_sidepanel_os()?;
-    Ok(format!("{}；{}", restart, sidepanel))
-}
+// 「重启 Chrome 并拉起侧边栏」命令同期移除：它内部同样要调
+// run_open_sidepanel_os 抢焦点，且二级自愈从未接线（一台机器多开 15 个实例，
+// 重启会把全部实例一起干掉，代价远大于收益，见 DEV-124837）。
 
 /// 检查更新（对比本地与远程版本）
 #[tauri::command]
@@ -1493,10 +1473,7 @@ pub fn run() {
             read_log_entries,
             read_log_page,
             get_system_snapshot,
-            open_plugin_sidepanel,
-            restart_chrome_and_open_sidepanel,
             get_patrol_report,
-            send_plugin_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
