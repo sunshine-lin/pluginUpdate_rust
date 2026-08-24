@@ -331,11 +331,30 @@ pub fn normalize_limit(limit: usize) -> usize {
 /// 判定，不是猜测——但消息本身也可能以方括号开头（如 "[Slider] ..."），
 /// 此时无法与"新格式插件名"区分，会被当作插件名解析掉、丢失该前缀。
 /// 这是已知的、可接受的历史数据局限（仅影响迁移窗口期内产生的旧格式日志）。
+/// 把读到的时间戳归一为北京时间。
+///
+/// # 为什么读取侧也要归一
+/// 归一本来只在写入时做（`log_server::ingest_log`）。那意味着**老客户端落盘的行
+/// 永远是插件上报的原始 UTC** —— 同一个文件里两种格式混着，而时间段筛选按
+/// 「第一个 HH:MM」取值当北京时间比较，对 UTC 那批会整体偏 8 小时。
+/// 2026-08-24 在 10 号机实测到：同一天 74000 行里，13:47 装上新版之前全是 UTC。
+///
+/// 只对含 `T` 的 ISO 形态调用转换函数，避免在几十万行的全量扫描里做无用的解析尝试
+/// （`--summary` 要扫全量，那条路径对每行的开销都敏感）。
+fn normalize_read_timestamp(raw: &str) -> std::borrow::Cow<'_, str> {
+    if raw.contains('T') {
+        std::borrow::Cow::Owned(crate::normalize_timestamp(raw))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
 pub fn parse_log_line(line: &str) -> Option<LogEntry> {
     let rest = line.strip_prefix('[')?;
     let (timestamp, rest) = rest.split_once("] [")?;
     let (level, rest) = rest.split_once("] [")?;
     let (source, rest) = rest.split_once("] ")?;
+    let timestamp = normalize_read_timestamp(timestamp);
 
     if let Some(after_bracket) = rest.strip_prefix('[') {
         if let Some((plugin_name, message)) = after_bracket.split_once("] ") {
@@ -939,6 +958,35 @@ mod tests {
         assert_eq!(entry.source, "background");
         assert_eq!(entry.plugin_name, "robot-01");
         assert_eq!(entry.message, "service worker 崩溃");
+    }
+
+    #[test]
+    fn test_parse_log_line_normalizes_utc_timestamp_on_read() {
+        // 归一发生在写入时（log_server），所以老客户端落盘的行永远是 UTC。
+        // 同一个文件里两种格式混着，时间段筛选按「第一个 HH:MM」取值当北京时间比，
+        // 对 UTC 那批会整体偏 8 小时——2026-08-24 在 10 号机实测到这个现象。
+        // 读取侧再归一一次，让存量数据也对齐，不必等 7 天保留期滚完。
+        let entry = parse_log_line(
+            "[2026-08-24T05:43:32.721Z] [WARN] [sidepanel] [10-1-LS10344] 超时",
+        )
+        .expect("UTC 时间戳的行应能解析");
+        assert_eq!(
+            entry.timestamp, "2026-08-24 13:43:32.721",
+            "带 Z 的 UTC 时间戳应归一为北京时间，否则时间段筛选偏 8 小时"
+        );
+    }
+
+    #[test]
+    fn test_parse_log_line_keeps_local_timestamp_unchanged() {
+        // 归一必须幂等：新客户端写入时已经归一过，读取时不能再加 8 小时
+        let entry = parse_log_line(
+            "[2026-08-24 13:51:27.176] [WARN] [sidepanel] [10-1-LS10344] 超时",
+        )
+        .expect("本地格式时间戳应能解析");
+        assert_eq!(
+            entry.timestamp, "2026-08-24 13:51:27.176",
+            "已是本地格式的时间戳不可再次偏移，否则新写入的行会被推到未来"
+        );
     }
 
     #[test]
