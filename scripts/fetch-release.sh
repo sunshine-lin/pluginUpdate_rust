@@ -34,10 +34,27 @@ ARTIFACT_NAME="updater-release"
 # 单次下载的超时。4MB 的包在公司网络约 30~60 秒，给足余量
 DOWNLOAD_TIMEOUT=600
 
+# latest.json 里下载地址的前缀。默认自建站；--url-base 可临时改成别处。
+#
+# # 为什么需要能改
+# 2026-08-24：chainai 的边缘 nginx 对 Accept: application/octet-stream 整站返回
+# 500，而 tauri updater 下载时正是发这个头。0.3.1 起客户端自己传 Accept: */*
+# 绕开了，但**旧客户端改不了** —— 于是出现引导悖论：修复只有装上才生效、而装不上。
+#
+# 破局点是 latest.json 的 url 完全自由：updater 只校验 endpoints 的 scheme
+# （config.rs 的 validate_endpoints），download_url 不校验，连 http:// 都行。
+# 所以把它临时指向一台局域网 HTTP 服务，旧客户端就能下得动、装上 0.3.1；
+# 全部升上来之后再切回自建站（那时客户端已经发 */* 了，不再触发那条规则）。
+#
+# 安全上不打折：minisign 签的是文件字节、公钥编译进二进制，走明文 HTTP
+# 也无法被替换——签名对不上客户端直接拒绝安装。
+DEFAULT_URL_BASE="https://chainai.cjdropshipping.cn/updater/"
+
 PUBLISH=0
 WAIT=0
 DRY_RUN=0
 NOTES_FILE=""
+URL_BASE="$DEFAULT_URL_BASE"
 while [ $# -gt 0 ]; do
   case "$1" in
     --publish) PUBLISH=1 ;;
@@ -47,6 +64,13 @@ while [ $# -gt 0 ]; do
       shift
       NOTES_FILE="${1:-}"
       [ -n "$NOTES_FILE" ] || { echo "错误: --notes-file 后面要跟文件路径。" >&2; exit 2; }
+      ;;
+    --url-base)
+      shift
+      URL_BASE="${1:-}"
+      [ -n "$URL_BASE" ] || { echo "错误: --url-base 后面要跟地址前缀。" >&2; exit 2; }
+      # 少一个斜杠就会拼出 .../updateraichat%20... 这种 404 地址，直接补上
+      case "$URL_BASE" in */) ;; *) URL_BASE="$URL_BASE/" ;; esac
       ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
@@ -189,9 +213,9 @@ fi
 
 echo "更新 latest.json → v$VERSION"
 EXE_NAME=$(basename "$EXE")
-python3 - "$PLUGIN_UPDATER_DIR" "$VERSION" "$EXE_NAME" "$NOTES_FILE" "$DRY_RUN" <<'PYEOF'
+python3 - "$PLUGIN_UPDATER_DIR" "$VERSION" "$EXE_NAME" "$NOTES_FILE" "$DRY_RUN" "$URL_BASE" <<'PYEOF'
 import json, os, sys, urllib.parse, datetime
-d, version, exe_name, notes_file, dry = sys.argv[1:6]
+d, version, exe_name, notes_file, dry, url_base = sys.argv[1:7]
 manifest = os.path.join(d, 'latest.json')
 with open(manifest, encoding='utf-8') as f:
     m = json.load(f)
@@ -205,8 +229,9 @@ m['pub_date'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT
 m['platforms']['windows-x86_64'] = {
     'signature': sig,
     # 文件名含空格，必须百分号编码——否则客户端下载会 404
-    'url': 'https://chainai.cjdropshipping.cn/updater/' + urllib.parse.quote(exe_name),
+    'url': url_base + urllib.parse.quote(exe_name),
 }
+print('  下载地址:', m['platforms']['windows-x86_64']['url'])
 if dry == '1':
     print('  [dry-run] 不写入。latest.json 将变成:')
     for line in json.dumps(m, ensure_ascii=False, indent=2).splitlines():
@@ -259,24 +284,51 @@ fi
 echo
 echo "✅ 已推送 v$VERSION（tag $TAG）"
 echo
-# 推送 ≠ 上线：插件仓库由 GitLab CI 构建镜像再部署，实测约 4 分钟。
-# 这里主动等一下并核实，否则「推完就以为发布好了」——而线上还是旧的
-echo "等待 GitLab CI 部署（推送不等于上线，实测约 4 分钟）…"
+# 推送 ≠ 上线，而且**不会自动上线**：pms-aichat 的 .gitlab-ci.yml 里 test /
+# buildTest / deploy 三个 job 全是 `only: master`，推 release 分支一条流水线都不触发。
+# 线上那份 updater 目录要靠人手动打包部署。
+#
+# 2026-08-24 踩过：脚本推完 release 就开始轮询等部署，等了 10 分钟线上纹丝不动，
+# 因为压根没有流水线在跑。这里改成先明确提示要人工操作，再等——
+# 不提示的话，看到「等待部署…」会以为流程在自动往下走。
+echo
+echo "════════════════════════════════════════════════════════════"
+echo " ⚠️  需要人工操作：现在去手动打包部署 pms-aichat 的 release 分支"
+echo "     （.gitlab-ci.yml 三个 job 都是 only: master，推 release 不触发流水线）"
+echo "     不做这一步，线上 latest.json 不会变，没有任何机器会升级。"
+echo "════════════════════════════════════════════════════════════"
+echo
+echo "等待部署生效（部署完会自动检测到）…"
 MANIFEST_URL="https://chainai.cjdropshipping.cn/updater/latest.json"
+EXPECT_URL="${URL_BASE}$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$EXE_NAME")"
 DEPLOYED=0
 for _ in $(seq 1 20); do
   sleep 30
-  LIVE=$(curl -s --max-time 20 "$MANIFEST_URL" \
-    | python3 -c "import sys,json;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || echo "")
-  echo "  线上 latest.json 版本: ${LIVE:-取不到}"
-  if [ "$LIVE" = "$VERSION" ]; then DEPLOYED=1; break; fi
+  # 版本 + 下载地址都要对上。只比版本会误判：重发同一版本换下载地址时
+  # （引导 0.2.x 那种场景），线上旧清单的版本本来就等于目标版本，
+  # 会在部署完成之前就报「已生效」
+  LIVE=$(curl -s --max-time 20 "$MANIFEST_URL" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('version',''), d['platforms']['windows-x86_64']['url'])
+except Exception:
+    print('', '')
+" 2>/dev/null || echo " ")
+  LIVE_VER=$(echo "$LIVE" | awk '{print $1}')
+  LIVE_URL=$(echo "$LIVE" | awk '{print $2}')
+  echo "  线上: 版本=${LIVE_VER:-取不到} 地址=${LIVE_URL:-取不到}"
+  if [ "$LIVE_VER" = "$VERSION" ] && [ "$LIVE_URL" = "$EXPECT_URL" ]; then DEPLOYED=1; break; fi
 done
 
 if [ "$DEPLOYED" -eq 1 ]; then
   echo "✅ 线上已是 v$VERSION，机器会在下次检查（最长 4 小时）时尝试升级。"
 else
-  echo "⚠️  等了 10 分钟线上仍不是 v$VERSION。去 GitLab 看部署流水线是否失败；" >&2
+  echo "⚠️  等了 10 分钟线上仍不是 v$VERSION。最常见的原因是**还没手动打包部署**" >&2
+  echo "    （推 release 不会自动触发流水线，见上面的提示）。" >&2
   echo "    在它上线前，没有任何机器会看到这个版本。" >&2
+  echo "    部署完可以只跑这一条确认，不必重跑整个脚本：" >&2
+  echo "      curl -s $MANIFEST_URL | python3 -m json.tool" >&2
 fi
 echo
 echo "核实各台是否真的升上来: 查每台的 client 日志有没有"

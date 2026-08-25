@@ -1051,6 +1051,35 @@ pub fn build_firewall_rule_script_windows(port: u16) -> String {
     )
 }
 
+/// 包一层 PowerShell，把 netsh 的输出转成 UTF-8 再交给我们。
+///
+/// # 为什么需要这层转换
+/// 2026-08-24 真机（中文 Windows）实测，这条日志长这样：
+///   `退出码=1 stdout=����Ĳ�����Ҫ����(��Ϊ����Ա����)��`
+/// 原文是「请求的操作需要提升(作为管理员运行)」——netsh 按控制台代码页
+/// （中文系统是 GBK/936）输出，而 Rust 侧按 UTF-8 解，于是全成了替换字符。
+///
+/// 这次靠猜能还原（因为已经知道是权限问题），但**下次遇到没见过的错误就真读不出来**
+/// ——而这条日志正是防火墙盲区的唯一仪表，读不出等于没有。
+///
+/// 做法：让 PowerShell 先用默认（OEM）编码正确地把 netsh 输出读成字符串，
+/// 再把自身输出编码切成 UTF-8 后写出。顺序不能反 —— 先切成 UTF-8 会让
+/// PowerShell 用 UTF-8 去解 GBK 字节，反而更糟。
+///
+/// `$LASTEXITCODE` 必须在切编码之前取：中间任何一条命令都会覆盖它。
+pub fn build_firewall_powershell_script(port: u16) -> String {
+    format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         netsh advfirewall firewall delete rule name=\"aichat-updater\" | Out-Null; \
+         $out = {} 2>&1 | Out-String; \
+         $code = $LASTEXITCODE; \
+         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         Write-Output $out; \
+         exit $code",
+        build_firewall_rule_script_windows(port)
+    )
+}
+
 /// 获取日志服务端口，供前端展示与插件侧发现（0 表示服务未启动）
 #[tauri::command]
 fn get_log_server_port() -> u16 {
@@ -1182,11 +1211,9 @@ fn try_add_firewall_rule(port: u16) {
 fn try_add_firewall_rule_os(port: u16) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // 规则同名时 netsh 会再加一条重复规则而不报错，故先删后加保持幂等
-    let script = format!(
-        "netsh advfirewall firewall delete rule name=\"aichat-updater\" >$null 2>&1; {}",
-        build_firewall_rule_script_windows(port)
-    );
+    // 规则同名时 netsh 会再加一条重复规则而不报错，故先删后加保持幂等。
+    // 编码转换见 build_firewall_powershell_script 的文档
+    let script = build_firewall_powershell_script(port);
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
@@ -3202,6 +3229,30 @@ mod tests {
             extract_updater_endpoint(&serde_json::json!({"updater": {}})),
             "未配置"
         );
+    }
+
+    #[test]
+    fn test_firewall_powershell_script_converts_output_encoding() {
+        // 2026-08-24 真机（中文 Windows）实测这条日志出来是
+        // 「stdout=����Ĳ�����Ҫ����」——netsh 按 GBK 输出、Rust 按 UTF-8 解。
+        // 靠猜能还原成「请求的操作需要提升」，但下次遇到没见过的错误就读不出来了
+        let s = build_firewall_powershell_script(17653);
+        assert!(
+            s.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"),
+            "必须把 PowerShell 的输出编码切成 UTF-8，否则中文 Windows 上拿到的是乱码"
+        );
+        let enc_pos = s.find("OutputEncoding").expect("应含编码设置");
+        let out_pos = s.find("$out = ").expect("应先捕获 netsh 输出");
+        assert!(
+            out_pos < enc_pos,
+            "必须先用默认(OEM)编码读 netsh 输出、再切 UTF-8 写出。顺序反了会用 UTF-8 去解 GBK 字节，比不转还糟"
+        );
+        let code_pos = s.find("$code = $LASTEXITCODE").expect("应保存退出码");
+        assert!(
+            code_pos < enc_pos,
+            "退出码要在切编码之前取——中间任何一条命令都会覆盖 $LASTEXITCODE"
+        );
+        assert!(s.contains("delete rule"), "先删后加保持幂等，否则重复安装会堆出多条同名规则");
     }
 
     #[test]
