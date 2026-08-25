@@ -434,8 +434,9 @@ fn run_refresh_chrome_tabs_os() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn run_refresh_chrome_tabs_os() -> Result<String, String> {
     let cmd = build_refresh_all_tabs_command_windows();
-    let output = std::process::Command::new("powershell")
-        .args(["-Command", &cmd])
+    // 同样必须走 powershell_no_window。频率虽低（只在更新插件后跑一次），
+    // 但那个时机机器正在干活，弹窗一样抢焦点
+    let output = powershell_no_window(&cmd)
         .output()
         .map_err(|e| format!("执行PowerShell刷新失败: {}", e))?;
     if output.status.success() {
@@ -528,8 +529,9 @@ fn run_open_sidepanel_os() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn run_open_sidepanel_os() -> Result<String, String> {
     let cmd = build_open_sidepanel_command_windows();
-    let output = std::process::Command::new("powershell")
-        .args(["-Command", &cmd])
+    // 走 powershell_no_window：本函数虽已停用，但接线时若漏了这个标志
+    // 就会重蹈 2026-08-21 的覆辙（弹窗抢焦点打断插件输入）
+    let output = powershell_no_window(&cmd)
         .output()
         .map_err(|e| format!("执行PowerShell打开侧边栏失败: {}", e))?;
     if output.status.success() {
@@ -611,8 +613,9 @@ fn run_restart_chrome_os() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn run_restart_chrome_os() -> Result<String, String> {
     let cmd = build_restart_chrome_command_windows();
-    let output = std::process::Command::new("powershell")
-        .args(["-Command", &cmd])
+    // 走 powershell_no_window：本函数虽已停用，但接线时若漏了这个标志
+    // 就会重蹈 2026-08-21 的覆辙（弹窗抢焦点打断插件输入）
+    let output = powershell_no_window(&cmd)
         .output()
         .map_err(|e| format!("执行PowerShell重启Chrome失败: {}", e))?;
     if output.status.success() {
@@ -1207,16 +1210,37 @@ fn try_add_firewall_rule(port: u16) {
     }
 }
 
+/// 构建一个**不弹控制台窗口**的 PowerShell 调用。
+///
+/// # 为什么必须统一走这里
+/// 少加 `CREATE_NO_WINDOW` 的后果不是「界面难看」，而是**抢走前台焦点** ——
+/// 而焦点是全局唯一资源：一台采购机上跑着 8~10 个 Chrome 实例，插件正在往
+/// 供应商聊天框输入文字，焦点被抢走会让后续按键落到别处、或者输入丢字，
+/// 把发出去的聊天内容弄脏。
+///
+/// 2026-08-21 正是因为这个原因砍掉了「自动拉起侧边栏」整条路径，
+/// 但 2026-08-25 在真机上发现巡检页仍在弹窗：`list_chrome_windows_os` 漏了这个
+/// 标志，而巡检页每 5 秒刷新一次 —— 等于每 5 秒抢一次焦点，比当初砍掉的那条
+/// 路径还频繁。同一个坑从另一个地方漏了进来。
+///
+/// 故把标志收进本函数，新增 PowerShell 调用一律用它，不要再各自 `Command::new`。
+#[cfg(target_os = "windows")]
+fn powershell_no_window(script: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    // Win32 CREATE_NO_WINDOW：子进程不分配控制台窗口，因而不会抢焦点
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 #[cfg(target_os = "windows")]
 fn try_add_firewall_rule_os(port: u16) -> Result<String, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // 规则同名时 netsh 会再加一条重复规则而不报错，故先删后加保持幂等。
     // 编码转换见 build_firewall_powershell_script 的文档
     let script = build_firewall_powershell_script(port);
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
+    let output = powershell_no_window(&script)
         .output()
         .map_err(|e| e.to_string())?;
     let detail = describe_command_output(
@@ -1450,8 +1474,9 @@ fn get_patrol_report() -> Result<PatrolReport, String> {
 #[cfg(target_os = "windows")]
 fn list_chrome_windows_os() -> Result<Vec<(u32, bool)>, String> {
     let cmd = build_list_chrome_windows_command_windows();
-    let output = std::process::Command::new("powershell")
-        .args(["-Command", &cmd])
+    // 必须走 powershell_no_window：巡检页每 5 秒刷新一次，弹一次控制台窗口
+    // 就抢一次前台焦点——同机 8~10 个实例正在往聊天框打字，会被打断、丢字
+    let output = powershell_no_window(&cmd)
         .output()
         .map_err(|e| format!("枚举 Chrome 窗口失败: {}", e))?;
     Ok(parse_chrome_window_states(
@@ -3228,6 +3253,27 @@ mod tests {
         assert_eq!(
             extract_updater_endpoint(&serde_json::json!({"updater": {}})),
             "未配置"
+        );
+    }
+
+    #[test]
+    fn test_no_bare_powershell_invocation_outside_helper() {
+        // 少加 CREATE_NO_WINDOW 的后果不是「界面难看」，是**抢走前台焦点**。
+        // 2026-08-21 因为抢焦点砍掉了「自动拉起侧边栏」整条路径；2026-08-25 在
+        // 真机上发现巡检页仍每 5 秒弹一次 PowerShell 窗口——list_chrome_windows_os
+        // 漏了这个标志。同一个坑从另一个地方漏了进来，而这种遗漏肉眼扫不出来。
+        //
+        // 故用测试挡住：除 powershell_no_window 自身外，不允许再出现裸调用。
+        let src = include_str!("lib.rs");
+        // 拼接而非写成字面量：直接写全会让本测试自身也被计入，
+        // 断言数就永远比实际多 1（第一版就是这么挂的）
+        let needle = format!("Command::new({}powershell{})", '"', '"');
+        let bare = src.matches(needle.as_str()).count();
+        assert_eq!(
+            bare, 1,
+            "只允许 powershell_no_window 内部有一处裸调用；\
+             新增 PowerShell 调用请走该辅助函数，否则会弹控制台窗口抢焦点，\
+             打断同机其它实例往供应商聊天框的输入"
         );
     }
 
