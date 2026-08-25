@@ -1,0 +1,7 @@
+# 本机派生缓存，故意不入库：
+# - machines.json    10 台采购机的内网 IP 与主机名
+# - plugin-index.json 90+ 个实例名（含 1688/CJ 账号 ID）
+# 两者本机扫一次就能重建，而本仓库的 GitHub 远端是公开的 ——
+# 提交上去等于把「哪些账号在跑自动化」告诉 1688
+machines.json
+plugin-index.json
