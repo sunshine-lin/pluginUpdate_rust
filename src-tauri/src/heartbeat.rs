@@ -66,6 +66,11 @@ pub struct HeartbeatRequest {
     /// 会导致询价发给错误的供应商账号
     #[serde(default)]
     pub actual_account: Option<String>,
+    /// 当前登录的 CJ 账号。上面两个都是 1688 账号，光看它们分不清
+    /// 「这台机器是谁在用」；而 CJ 账号正是查应绑 1688 账号的入口，
+    /// 串号排查要知道映射的两端才判断得出是配错了还是登错了
+    #[serde(default)]
+    pub cj_account: Option<String>,
     /// 上一轮已执行完的指令 id，客户端据此出队
     #[serde(default)]
     pub acked: Vec<String>,
@@ -100,6 +105,8 @@ pub struct PluginState {
     pub expected_account: Option<String>,
     /// 实际登录的 1688 账号
     pub actual_account: Option<String>,
+    /// 当前登录的 CJ 账号
+    pub cj_account: Option<String>,
     /// 待下发指令队列（已下发但未收到 ack 的仍留在队列里，故会重复下发）
     pub pending: Vec<Command>,
     /// 已下发 reload 但插件尚未恢复心跳时，避免每轮都重复入队
@@ -126,6 +133,7 @@ impl PluginState {
             login_1688: None,
             expected_account: None,
             actual_account: None,
+            cj_account: None,
             pending: Vec::new(),
             reload_issued: false,
             restart_count: 0,
@@ -187,6 +195,9 @@ pub struct PluginSnapshot {
     pub login_1688: Option<bool>,
     pub expected_account: Option<String>,
     pub actual_account: Option<String>,
+    /// 当前登录的 CJ 账号。1688 账号回答「登的是哪个供应商侧账号」，
+    /// 它回答「这台机器归谁用」——串号排查需要映射的两端
+    pub cj_account: Option<String>,
     /// 账号是否串号：两个账号都已上报且不一致。
     /// 单独给出而非让前端比对，是因为「未上报」与「不一致」必须区分开
     pub account_mismatch: bool,
@@ -242,6 +253,9 @@ impl HeartbeatRegistry {
         if req.actual_account.is_some() {
             state.actual_account = req.actual_account.clone();
         }
+        if req.cj_account.is_some() {
+            state.cj_account = req.cj_account.clone();
+        }
 
         // 收到心跳即说明插件活着，解除失联抑制标记。
         //
@@ -259,6 +273,17 @@ impl HeartbeatRegistry {
         HeartbeatResponse {
             commands: state.pending.clone(),
         }
+    }
+
+    /// 该实例是否上报过心跳。
+    ///
+    /// 供下发指令时区分两种失败：「同类指令已在队列」（点重复了，无害）与
+    /// 「实例从未上报过」（插件没连上，点了也白点）。两者对使用者的含义完全
+    /// 不同，合并成一句话说不清。
+    ///
+    /// 不用 `snapshots()` 代替：那会为回答一个存在性问题构造并排序全部快照。
+    pub fn has_plugin(&self, plugin_name: &str) -> bool {
+        self.plugins.contains_key(plugin_name)
     }
 
     /// 生成全部实例的巡检快照，异常的排在前面。
@@ -293,6 +318,7 @@ impl HeartbeatRegistry {
                     login_1688: s.login_1688,
                     expected_account: s.expected_account.clone(),
                     actual_account: s.actual_account.clone(),
+                    cj_account: s.cj_account.clone(),
                     account_mismatch,
                     has_issue,
                 }
@@ -467,6 +493,7 @@ mod tests {
             login_1688: None,
             expected_account: None,
             actual_account: None,
+            cj_account: None,
             acked,
         }
     }
@@ -487,8 +514,43 @@ mod tests {
             login_1688: login,
             expected_account: expected.map(|s| s.to_string()),
             actual_account: actual.map(|s| s.to_string()),
+            cj_account: None,
             acked: vec![],
         }
+    }
+
+    #[test]
+    fn test_snapshot_reports_cj_account() {
+        // CJ 账号回答「这台机器归谁用」，1688 账号回答「登的是哪个供应商侧账号」。
+        // 串号排查需要映射的两端：只看 1688 侧那半边，判断不出是账号配错了
+        // 还是人登错了
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        let mut r = patrol_req("robot-01", Some(true), Some(true), Some("acc-a"), Some("acc-a"));
+        r.cj_account = Some("CJ12345".to_string());
+        reg.on_heartbeat(&r, now);
+
+        let snaps = reg.snapshots(now);
+        assert_eq!(snaps[0].cj_account.as_deref(), Some("CJ12345"));
+    }
+
+    #[test]
+    fn test_cj_account_not_cleared_by_old_plugin_heartbeat() {
+        // 旧版插件不上报这个字段，收到它的心跳时不能把已有值清成 None——
+        // 否则新旧版本混跑时看板会闪烁（与 ws_connected 等字段同一处理）
+        let mut reg = HeartbeatRegistry::new();
+        let now = Instant::now();
+        let mut r = patrol_req("robot-01", Some(true), Some(true), None, None);
+        r.cj_account = Some("CJ12345".to_string());
+        reg.on_heartbeat(&r, now);
+        // 旧版插件的心跳：cj_account 为 None
+        reg.on_heartbeat(&req("robot-01", true, vec![]), now);
+
+        assert_eq!(
+            reg.snapshots(now)[0].cj_account.as_deref(),
+            Some("CJ12345"),
+            "未上报应保留上次值，不是清空"
+        );
     }
 
     #[test]
@@ -610,6 +672,17 @@ mod tests {
             Some(true),
             "未上报的巡检字段应保留上次值，不应被清成 None"
         );
+    }
+
+    #[test]
+    fn test_has_plugin_distinguishes_reported_from_unknown() {
+        // 下发指令失败时要能分清「指令已在队列」与「这个实例根本没上报过」——
+        // 后者意味着插件没运行或版本过旧，点多少次都没用，必须告诉使用者
+        let mut reg = HeartbeatRegistry::new();
+        assert!(!reg.has_plugin("robot-01"), "从未上报过的实例应为 false");
+        reg.on_heartbeat(&req("robot-01", true, vec![]), Instant::now());
+        assert!(reg.has_plugin("robot-01"), "上报过的实例应为 true");
+        assert!(!reg.has_plugin("robot-02"), "不应误报其它实例");
     }
 
     #[test]
@@ -1037,6 +1110,7 @@ mod tests {
             login_1688: None,
             expected_account: None,
             actual_account: None,
+            cj_account: None,
             acked: vec![],
         };
         reg.on_heartbeat(&r, now);

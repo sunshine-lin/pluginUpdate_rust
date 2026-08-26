@@ -1461,14 +1461,74 @@ fn get_patrol_report() -> Result<PatrolReport, String> {
     })
 }
 
-// 「下发指令」命令已于 2026-08-24 移除（连同巡检页的「重连 WS」按钮）。
-// 本期范围收窄为「只把日志链路跑通」，客户端不做任何自愈操作；而线上插件
-// （release 分支）根本没有指令处理代码——heartbeat.ts 那批改动全在
-// feat/client-heartbeat-selfheal 分支上、从未上线。下发过去只会被忽略、
-// 永远收不到 ack，指令在队列里一直堆着，每次心跳都白传一遍。
-//
-// HeartbeatRegistry::enqueue_command 保留（含去重与未知实例拒绝的测试），
-// 插件侧指令处理合入 release 后重新接线即可。
+/// 客户端能下发给插件的指令白名单。
+///
+/// # 为什么必须是白名单
+/// 指令类型直接来自前端。插件侧按 `handlers[cmd.type]` 分发，放开等于让界面
+/// 能驱动插件执行任意键名。
+///
+/// # 与插件侧的对应关系（改这里必须同步改那边）
+/// 每一项都要在 `pms-aichat` 的 `background.ts` 里有对应 handler，否则下发过去
+/// 会被当未知类型忽略、**永远收不到 ack**，指令就一直堆在队列里、每次心跳都
+/// 白传一遍（2026-08-24 移除下发路径时踩的正是这个）。
+///
+/// | 指令 | 插件侧动作 | 会不会关掉侧边栏 |
+/// |---|---|---|
+/// | `reconnectWs` | `wsInit()` 重连业务 WS | 否 |
+/// | `reload` | `chrome.runtime.reload()` | **会**，且无法由代码重开 |
+/// | `refreshSidepanel` | 侧边栏 `location.reload()` | 否 —— 日常该用的「重启」 |
+/// | `trigger1688Login` | 清冷却 + 后台打开 1688 登录页 | 否 |
+const PLUGIN_COMMANDS: [&str; 4] = [
+    "reconnectWs",
+    "reload",
+    "refreshSidepanel",
+    "trigger1688Login",
+];
+
+/// 校验前端传来的指令类型（纯函数，可测）
+fn validate_plugin_command(kind: &str) -> Result<(), String> {
+    if PLUGIN_COMMANDS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(format!("不支持的指令类型: {}", kind))
+    }
+}
+
+/// 向指定插件实例下发一条指令。
+///
+/// 指令入队后由**插件下次心跳时取走**（最长等 5 秒），执行成功才回 ack、
+/// 客户端据此出队。所以这里返回「已下发」只代表入队成功，**不代表已执行** ——
+/// 界面上的措辞要如实反映这一点，否则人点完以为生效了，实际插件可能压根没接。
+///
+/// # 只做人工触发
+/// 本轮不接任何自动判定。两次教训都出在自动触发上：抢焦点（2026-08-21 砍掉
+/// 自动拉起侧边栏）、登录死循环（插件侧回滚 9ef8533e）。人点一次是单发，
+/// 形不成放大环；要接自动触发得逐条重新评估。
+#[tauri::command]
+fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
+    validate_plugin_command(&kind)?;
+    let reg = HEARTBEATS.get().ok_or("心跳服务未启动")?;
+    let mut guard = reg.lock().map_err(|_| "心跳状态表不可用".to_string())?;
+    match guard.enqueue_command(&plugin_name, &kind) {
+        Some(_) => {
+            log_client_info(&format!("[巡检] 已向 {} 下发 {} 指令", plugin_name, kind));
+            Ok(format!("已下发 {}，等待插件下次心跳取走（最长 5 秒）", kind))
+        }
+        // enqueue_command 返回 None 有两种原因，对使用者的含义完全不同：
+        // 同类指令已在队列（点重复了，无害）vs 该实例从未上报过心跳（插件没连上，
+        // 点了也白点）。这里合并成一句话说不清，故分开判断
+        None => {
+            if guard.has_plugin(&plugin_name) {
+                Ok(format!("{} 指令已在队列中，等待执行", kind))
+            } else {
+                Err(format!(
+                    "{} 从未上报过心跳，可能插件未运行或版本过旧（指令需插件 ≥ 支持心跳的版本）",
+                    plugin_name
+                ))
+            }
+        }
+    }
+}
 
 /// 枚举 Chrome 窗口及最小化状态
 #[cfg(target_os = "windows")]
@@ -1978,6 +2038,7 @@ pub fn run() {
             log_self_update_failure,
             log_self_update_progress,
             diagnose_download_url,
+            send_plugin_command,
             list_log_dates,
             read_log_entries,
             read_log_page,
@@ -3253,6 +3314,39 @@ mod tests {
         assert_eq!(
             extract_updater_endpoint(&serde_json::json!({"updater": {}})),
             "未配置"
+        );
+    }
+
+    #[test]
+    fn test_plugin_command_whitelist_rejects_unknown_kind() {
+        // 指令类型直接来自前端，必须白名单。放开等于让界面能让插件执行任意
+        // 字符串指令——插件侧是按 handlers[cmd.type] 分发的，将来新增 handler
+        // 时白名单没跟上还好（只是用不了），反过来白名单先放开就是隐患
+        assert!(validate_plugin_command("reconnectWs").is_ok());
+        assert!(validate_plugin_command("reload").is_ok());
+        assert!(validate_plugin_command("refreshSidepanel").is_ok());
+        assert!(validate_plugin_command("trigger1688Login").is_ok());
+
+        assert!(validate_plugin_command("rm -rf").is_err());
+        assert!(validate_plugin_command("").is_err());
+        // 大小写不同即不同指令：插件侧是精确匹配 handlers 的键
+        assert!(validate_plugin_command("Reload").is_err());
+    }
+
+    #[test]
+    fn test_plugin_command_whitelist_matches_plugin_handlers() {
+        // 客户端白名单与插件侧 handlers 必须一一对应。少了 → 界面上的按钮
+        // 点了没反应；多了 → 下发一条插件不认识的指令，被当未知类型忽略、
+        // 永远收不到 ack，于是在队列里一直堆着、每次心跳都白传一遍
+        // （2026-08-24 移除下发路径时踩的正是这个）。
+        //
+        // 插件侧代码不在本仓库，无法编译期校验，故把清单显式列在这里，
+        // 改动任一边都要同步改这个断言。
+        let expected = ["reconnectWs", "reload", "refreshSidepanel", "trigger1688Login"];
+        assert_eq!(
+            PLUGIN_COMMANDS, expected,
+            "客户端白名单变了：请同步确认 pms-aichat 的 background.ts handlers 里\
+             有对应实现，否则指令会永远堆在队列里"
         );
     }
 
