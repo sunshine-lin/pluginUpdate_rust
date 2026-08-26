@@ -712,11 +712,14 @@
 
 /* 插件名称：定宽 200px。实测最长的实例名「虚拟机3-chrome10-cj08115」
    约 22 字符，200px 放不下全部，截断后靠 title 看全——这是有意的取舍：
-   给它足够宽会挤掉 1688 账号列，而后者在串号时要显示两个账号 */
-.patrol-view .log-table td.patrol-name,
+   给它足够宽会挤掉 1688 账号列，而后者在串号时要显示两个账号。
+   
+   ⚠️ 这里不能写 max-width:0。那是给**自适应列**用的技巧（配合
+   table-layout:fixed 让百分比宽度生效），而 CSS 里 max-width 优先级
+   高于 width——两者写在一起时 width:200px 会被完全忽略，列被压成
+   最小内容宽度（真机上表现为「插件名称」只显示得下两个字符）。 */
 .patrol-view .log-table th.col-name {
   width: 200px;
-  max-width: 0; /* 配合 table-layout:fixed，让宽度约束真正生效 */
 }
 
 /* 心跳列：「失联 8195s」是最长形态 */
