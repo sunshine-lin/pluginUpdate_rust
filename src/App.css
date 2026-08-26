@@ -685,27 +685,91 @@
 
 /* ───────── 插件巡检看板（DEV-125034） ───────── */
 
-/* 窗口固定 600px 宽，8 列表格挤不开会把表头压成竖排（「侧边栏」三个字
-   竖着排、「已打开」断成三行，完全没法读）。故给表格设最小宽度、
-   由外层容器横向滚动，而不是让浏览器逐字折行 */
+/* 不做横向滚动（2026-08-26 调整）。
+   原先给表格设 min-width: 820px + 外层 overflow-x: auto，窗口 600px 宽时
+   必然出现横向滚动条——而要点右侧的操作按钮就得先横向拖一次，每行都拖，
+   比看不全更烦。
+   改为表格始终撑满容器，超长内容截断加省略号、完整值放 title。
+   能这么做的前提：会超长的只有「实例」与「账号」两列，其余列内容都是
+   「已打开」「已连接」这种定长短词，不会被挤坏。 */
 .patrol-view .log-table {
-  min-width: 820px;
+  width: 100%;
+  table-layout: fixed;
 }
 
 .patrol-view .log-table th,
 .patrol-view .log-table td {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* 账号列是唯一可能很长的内容（串号时要显示两个账号），
-   允许它折行，其余列保持单行 */
+/* 列宽定死（2026-08-26）。`table-layout: fixed` 下浏览器按首行分配宽度，
+   而各列内容长度差别很大——不定死的话「侧边栏」这种三字表头会被挤成竖排，
+   而状态列其实只需要放「已打开」三个字。
+   分配思路：状态类列内容定长、给最小够用的宽度；剩余空间全部让给
+   实例名与 1688 账号这两列可变长内容。 */
+
+/* 插件名称：定宽 200px。实测最长的实例名「虚拟机3-chrome10-cj08115」
+   约 22 字符，200px 放不下全部，截断后靠 title 看全——这是有意的取舍：
+   给它足够宽会挤掉 1688 账号列，而后者在串号时要显示两个账号 */
+.patrol-view .log-table td.patrol-name,
+.patrol-view .log-table th.col-name {
+  width: 200px;
+  max-width: 0; /* 配合 table-layout:fixed，让宽度约束真正生效 */
+}
+
+/* 心跳列：「失联 8195s」是最长形态 */
+.patrol-view .log-table th.col-heartbeat {
+  width: 85px;
+}
+
+/* 状态四列：内容都是「已打开」「已连接」「已登录」「运行中」这类三字词。
+   60px 刚好容纳三字 + 内边距；表头「侧边栏」也是三字，不会被压成竖排 */
+.patrol-view .log-table th.col-status {
+  width: 60px;
+}
+
+/* CJ 账号：形如 CJ88001 */
+.patrol-view .log-table th.col-cj {
+  width: 85px;
+}
+
+/* 1688 账号列：串号时要显示两个账号，是最长的可变列，同样吃剩余宽度 */
 .patrol-view .log-table td.patrol-account {
-  white-space: normal;
-  min-width: 180px;
+  max-width: 0;
 }
 
-.patrol-view .log-table-wrap {
-  overflow-x: auto;
+/* 操作列定死宽度（2026-08-26）。
+   原先写的是 width:1% + overflow:visible，本意是「按内容撑开、别截断按钮」，
+   实际效果是这一列完全不受表格宽度约束——四个中文按钮硬撑出 ~310px，
+   加上其余定宽列就超过了 600px 窗口，横向滚动条正是这么冒出来的。
+   按钮文字同步压缩成 2 字以内（完整说明放 title），四个按钮约 160px。 */
+.patrol-view .log-table th.col-actions {
+  /* 实测所需：重连WS 74 + 刷新 40 + 登录1688 82 + 重载 40 + 间距 12 + 内边距 20 = 268px。
+     取 288 留余量——字体渲染在不同系统/缩放下有差异，卡着算容易再溢出，
+     而溢出的后果是横向滚动条回来（每行都要拖一次才能点到按钮） */
+  width: 288px;
+}
+
+/* 序号列：仅供口头指代（「第 3 行那台」）。40px 能放下两位数 + 内边距 */
+.patrol-view .log-table th.col-index {
+  width: 40px;
+}
+
+.patrol-view .log-table td.patrol-index {
+  color: #999;
+}
+
+/* 巡检页行高比日志页更松：每行末尾有四个按钮，6px 内边距会让按钮几乎贴住
+   上下边框；而且这张表只有十几行、不像日志页要在一屏里塞几百条，
+   宽松一点更好点也更好扫 */
+.patrol-view .log-table td {
+  padding: 10px;
+}
+
+.patrol-view .log-table thead th {
+  padding: 10px;
 }
 
 .patrol-summary {
@@ -745,6 +809,45 @@
 .patrol-bad {
   color: #dc2626;
   font-weight: 500;
+}
+
+/* 操作列（DEV-125035）：四个按钮横排，窄屏时换行而不是把表格撑出横向滚动 */
+.patrol-actions {
+  white-space: nowrap;
+}
+
+.patrol-btn {
+  padding: 4px 7px;
+  margin-right: 3px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+  color: #374151;
+  cursor: pointer;
+}
+
+.patrol-btn:hover:not(:disabled) {
+  border-color: #9ca3af;
+  background: #f9fafb;
+}
+
+.patrol-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 「重载」单独标红：它会销毁侧边栏，而侧边栏无法由代码重开——
+   插件会变成「活着但不能干活」，必须有人到那台机器上手动点开。
+   后果比其它三个操作重得多，配色上就要能一眼区分，而不是等人读 title */
+.patrol-btn-danger {
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
+.patrol-btn-danger:hover:not(:disabled) {
+  border-color: #ef4444;
+  background: #fef2f2;
 }
 
 /* 状态色需盖过上面异常行的 td 兜底色，否则绿/红会被压成深灰 */
@@ -1028,12 +1131,68 @@
     border-bottom-color: #2e3a5c;
   }
 
+  /* 斑马纹与底色的差值压小：原先 #1a2540 → #1e2a4a 跨度偏大，
+     十几行排下来条纹比内容还抢眼。斑马纹的作用是帮眼睛跨列对齐，
+     不是分区，能分辨出来就够 */
   .log-table tbody tr:nth-child(even) {
-    background: #1e2a4a;
+    background: #1d2744;
   }
 
   .log-table tbody tr:hover {
     background: #2a3660;
+  }
+
+  /* 巡检异常行的深色版（DEV-125035）。
+     浅色版用的是淡红底 #fff5f5 + 深色字，深色模式下没覆盖的话，一片白底会
+     直接盖在深色表格上——不只是刺眼，行内那些跟随全局的浅色文字（实例名、
+     「空闲」）落在白底上会糊成一团、几乎读不出来（真机截图实测）。
+     深色下改成暗红底，左侧红条保留：底色只做「这行要看」的弱提示，
+     真正的强调交给红条和列内的红字，不靠背景明度去抢注意力。 */
+  .patrol-row-issue {
+    background: #2b1d24;
+  }
+
+  .patrol-row-issue:hover {
+    background: #3a2530;
+  }
+
+  /* 覆盖浅色版把文字压深的那条规则——深色底上必须回到浅色字 */
+  .patrol-row-issue td {
+    color: #d4d4d8;
+  }
+
+  /* 状态色也要重新给：浅色版的 #15803d / #b91c1c 在暗底上太闷。
+     正常态刻意压低饱和度——巡检页大部分时候是全绿的，满屏亮绿会让真正
+     该注意的红字失去对比。绿色只需要「看得出是正常」，红色才需要抢眼 */
+  .patrol-row-issue td.patrol-ok,
+  .patrol-ok {
+    color: #6b9e7a;
+  }
+
+  .patrol-row-issue td.patrol-bad,
+  .patrol-bad {
+    color: #f87171;
+  }
+
+  .patrol-btn {
+    border-color: #3a4668;
+    background: #223055;
+    color: #c7d2e8;
+  }
+
+  .patrol-btn:hover:not(:disabled) {
+    border-color: #4d5b82;
+    background: #2b3a63;
+  }
+
+  .patrol-btn-danger {
+    border-color: #7f3a3a;
+    color: #f87171;
+  }
+
+  .patrol-btn-danger:hover:not(:disabled) {
+    border-color: #b91c1c;
+    background: #3d2222;
   }
 
   .log-table td {

@@ -43,6 +43,8 @@ interface PluginSnapshot {
   expectedAccount: string | null;
   actualAccount: string | null;
   accountMismatch: boolean;
+  /** 当前登录的 CJ 账号。1688 账号说「登的哪个供应商侧账号」，它说「这台归谁用」 */
+  cjAccount: string | null;
   hasIssue: boolean;
 }
 
@@ -169,7 +171,9 @@ type SelfUpdateState =
   | { kind: "ready"; version: string; notes: string };
 
 function App() {
-  const [view, setView] = useState<View>("update");
+  // 默认打开巡检页：日常最先要看的就是「哪台插件有问题」，
+  // 更新管理是偶尔才用一次的功能
+  const [view, setView] = useState<View>("patrol");
   const [activeEnv, setActiveEnv] = useState<Env>("online");
   const [appInfo, setAppInfo] = useState<UpdateInfo | null>(null);
   const [status, setStatus] = useState<string>("");
@@ -200,6 +204,10 @@ function App() {
   // 巡检看板（DEV-125034）
   const [patrol, setPatrol] = useState<PatrolReport | null>(null);
   const [patrolHint, setPatrolHint] = useState<string>("");
+  // 正在下发的指令（`实例名:指令`），非 null 时禁用全部按钮。
+  // 一次只允许一条在途：这些操作会改变插件状态，连点或并发下发时人无法
+  // 判断哪条生效了——而巡检页每 5 秒刷新一次，结果很快就能看到
+  const [sendingCmd, setSendingCmd] = useState<string | null>(null);
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
@@ -490,10 +498,44 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
-  // 「重连 WS」按钮已于 2026-08-24 移除：本期范围收窄为「只把日志链路跑通」，
-  // 客户端不做任何自愈操作。而线上插件（release 分支）根本没有指令处理代码，
-  // 下发过去只会被忽略、永远收不到 ack，指令在队列里一直堆着白传。
-  // 插件侧的指令处理合入 release 后再恢复。
+  /// 向某个插件实例下发一条指令。
+  ///
+  /// # 提示语为什么强调「已下发」而不是「已完成」
+  /// 指令入队后要等插件**下次心跳**才被取走（最长 5 秒），执行成功才回 ack。
+  /// 说成「已完成」会让人以为立刻生效了，而实际插件可能压根没接上——
+  /// 真正的结果看巡检表格自己的变化（每 5 秒刷新）。
+  ///
+  /// # 「重载」为什么要二次确认
+  /// 它会销毁侧边栏，而侧边栏**无法由代码重新打开**（Chrome 强制用户手势），
+  /// 结果是插件活着但不能干活，必须有人到那台机器上手动点开。这个后果比
+  /// 「点错了再点回来」严重得多，值得挡一道。
+  async function sendCommand(pluginName: string, kind: string) {
+    if (kind === "reload") {
+      const ok = window.confirm(
+        `确定要重载 ${pluginName} 吗？\n\n` +
+          `重载会关闭该实例的侧边栏，而侧边栏无法由程序重新打开——\n` +
+          `插件将无法处理任务，直到有人到那台机器上手动点开。\n\n` +
+          `如果只是想重置卡住的状态，请改用「刷新」。`,
+      );
+      if (!ok) return;
+    }
+    const key = `${pluginName}:${kind}`;
+    setSendingCmd(key);
+    setPatrolHint(`正在向 ${pluginName} 下发 ${kind}…`);
+    try {
+      const msg = await invoke<string>("send_plugin_command", {
+        pluginName,
+        kind,
+      });
+      setPatrolHint(`${pluginName}: ${msg}`);
+    } catch (e) {
+      // 失败原因对使用者是有意义的（实例没上报过 = 插件没运行或版本过旧），
+      // 不要吞掉换成一句「操作失败」
+      setPatrolHint(`${pluginName} 下发失败: ${e}`);
+    } finally {
+      setSendingCmd(null);
+    }
+  }
 
 
 
@@ -655,6 +697,12 @@ function App() {
     >
       <div className="view-tabs">
         <button
+          className={`view-tab-btn ${view === "patrol" ? "view-tab-active" : ""}`}
+          onClick={() => setView("patrol")}
+        >
+          插件巡检
+        </button>
+        <button
           className={`view-tab-btn ${view === "update" ? "view-tab-active" : ""}`}
           onClick={() => setView("update")}
         >
@@ -665,12 +713,6 @@ function App() {
           onClick={() => setView("logs")}
         >
           日志查看
-        </button>
-        <button
-          className={`view-tab-btn ${view === "patrol" ? "view-tab-active" : ""}`}
-          onClick={() => setView("patrol")}
-        >
-          插件巡检
         </button>
         <button
           className={`view-tab-btn ${view === "machine" ? "view-tab-active" : ""}`}
@@ -884,7 +926,7 @@ function App() {
         <div className="patrol-view">
           <div className="patrol-summary">
             <span>
-              实例 {patrol?.instances.length ?? 0} 个
+              插件 {patrol?.instances.length ?? 0} 个
               {patrol && patrol.instances.some((i) => i.hasIssue) && (
                 <b className="patrol-issue-count">
                   ，{patrol.instances.filter((i) => i.hasIssue).length} 个异常
@@ -907,19 +949,28 @@ function App() {
               <table className="log-table">
                 <thead>
                   <tr>
-                    <th>实例</th>
-                    <th>心跳</th>
-                    <th>侧边栏</th>
-                    <th>WS</th>
-                    <th>1688</th>
-                    <th>账号</th>
-                    <th>任务</th>
+                    <th className="col-index">#</th>
+                    <th className="col-name">插件名称</th>
+                    <th className="col-heartbeat">心跳</th>
+                    <th className="col-status">侧边栏</th>
+                    <th className="col-status">WS</th>
+                    <th className="col-status">1688</th>
+                    <th className="col-status">状态</th>
+                    <th className="col-cj">CJ账号</th>
+                    <th>1688账号</th>
+                    <th className="col-actions">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {patrol.instances.map((it) => (
+                  {patrol.instances.map((it, idx) => (
                     <tr key={it.pluginName} className={it.hasIssue ? "patrol-row-issue" : ""}>
-                      <td>{it.pluginName}</td>
+                      {/* 序号仅供口头指代（「第 3 行那台」），不是稳定标识——
+                          后端按「有异常的排前面」排序，同一台机器的序号会随状态变化 */}
+                      <td className="patrol-index">{idx + 1}</td>
+                      {/* 实例名可能被截断（表格不做横向滚动），title 里给全名 */}
+                      <td className="patrol-name" title={it.pluginName}>
+                        {it.pluginName}
+                      </td>
                       <td className={it.stale ? "patrol-bad" : "patrol-ok"}>
                         {it.stale ? `失联 ${it.silenceSecs}s` : `${it.silenceSecs}s 前`}
                       </td>
@@ -944,15 +995,67 @@ function App() {
                       >
                         {it.login1688 === null ? "—" : it.login1688 ? "已登录" : "未登录"}
                       </td>
-                      {/* 账号列：串号时把两个账号都显示出来，否则光说「不一致」没法判断该改哪边 */}
+                      <td>{it.taskRunning ? "运行中" : "空闲"}</td>
+                      {/* CJ 账号：这台机器归谁用。它是查「应绑 1688 账号」的入口 */}
+                      <td className="patrol-account" title={it.cjAccount ?? ""}>
+                        {it.cjAccount ?? "—"}
+                      </td>
+                      {/* 1688 账号：串号时把两个都显示出来，否则光说「不一致」没法判断该改哪边。
+                          完整内容放 title——这列会被截断（表格不做横向滚动） */}
                       <td
                         className={`patrol-account ${it.accountMismatch ? "patrol-bad" : ""}`}
+                        title={
+                          it.accountMismatch
+                            ? `应为 ${it.expectedAccount}，实为 ${it.actualAccount}`
+                            : (it.actualAccount ?? "")
+                        }
                       >
                         {it.accountMismatch
                           ? `串号：应为 ${it.expectedAccount}，实为 ${it.actualAccount}`
                           : (it.actualAccount ?? "—")}
                       </td>
-                      <td>{it.taskRunning ? "运行中" : "空闲"}</td>
+                      {/*
+                        操作列（DEV-125035）。四个按钮按「会不会让插件失去干活能力」
+                        排序与配色，最危险的放最后并单独标红：
+                        - 重连WS / 刷新 / 登录：都不关侧边栏，插件仍能干活
+                        - 重载：会销毁侧边栏，而侧边栏无法由代码重开
+                        全部只在人点击时触发，不接任何自动判定——两次教训
+                        （抢焦点、登录死循环）都出在自动触发上
+                      */}
+                      <td className="patrol-actions">
+                        <button
+                          className="patrol-btn"
+                          disabled={sendingCmd !== null}
+                          onClick={() => sendCommand(it.pluginName, "reconnectWs")}
+                          title="重新建立插件与业务服务端的 WebSocket 连接。不影响侧边栏"
+                        >
+                          重连WS
+                        </button>
+                        <button
+                          className="patrol-btn"
+                          disabled={sendingCmd !== null}
+                          onClick={() => sendCommand(it.pluginName, "refreshSidepanel")}
+                          title="刷新：重载侧边栏页面，重置卡住的状态机。侧边栏不会关闭，有任务在跑时插件会拒绝"
+                        >
+                          刷新
+                        </button>
+                        <button
+                          className="patrol-btn"
+                          disabled={sendingCmd !== null}
+                          onClick={() => sendCommand(it.pluginName, "trigger1688Login")}
+                          title="登录 1688：在后台标签页打开登录页，由插件自动完成登录。不抢焦点"
+                        >
+                          登录1688
+                        </button>
+                        <button
+                          className="patrol-btn patrol-btn-danger"
+                          disabled={sendingCmd !== null}
+                          onClick={() => sendCommand(it.pluginName, "reload")}
+                          title="重载插件：⚠️ 会关闭侧边栏且无法由代码重开，插件将无法干活直到有人手动打开——仅在侧边栏已经挂掉时使用"
+                        >
+                          重载
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
