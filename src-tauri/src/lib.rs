@@ -53,6 +53,18 @@ struct PathConfig {
     /// 分不清这台是升级成功了还是本来就是这版。
     #[serde(skip_serializing_if = "Option::is_none")]
     last_version: Option<String>,
+    /// 是否自动检查更新（2026-08-27）。**默认关**。
+    ///
+    /// # 为什么要有这个开关
+    /// 测图标点击这类功能时，机器在背后自动升级会重启客户端、打断测试，
+    /// 而且分不清问题是测试本身的还是升级造成的。
+    ///
+    /// # 默认关的代价（用户 2026-08-27 拍板，理由「点击一下就自动升级了」）
+    /// 新装机器会**永远停在安装时那个版本**，除非有人点「立即检查更新」。
+    /// 2026-08-24 刚踩过「自动更新坏了 6 天没人发现」，静默不升级同样难察觉，
+    /// 故必须配显眼的界面提示——见巡检页顶部告警条。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_update: Option<bool>,
     /// 透传本结构未声明的字段。serde 默认丢弃未知字段，
     /// 若不保留会在写入任一配置项时静默抹掉其它程序写入的数据
     #[serde(flatten)]
@@ -168,6 +180,41 @@ pub fn save_autostart_to_file(config_file: &PathBuf, enabled: bool) -> Result<()
     }
     let content = serde_json::to_string_pretty(&cfg)
         .map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}
+
+/// 读取自动检查更新偏好。
+///
+/// 配置缺失时返回 **false**（默认关，用户 2026-08-27 拍板）。
+/// 与 autostart 的「默认关」取向一致，但代价不同：那个只是不改开机项，
+/// 这个意味着不主动升级——发了修复版也要人点一下才生效。
+pub fn load_auto_update_from_file(config_file: &PathBuf) -> bool {
+    fs::read_to_string(config_file)
+        .ok()
+        .and_then(|c| serde_json::from_str::<PathConfig>(&c).ok())
+        .and_then(|cfg| cfg.auto_update)
+        .unwrap_or(false)
+}
+
+/// 写入自动检查更新偏好（保留其它字段不变）。
+///
+/// 必须保留其它字段：config.json 里还有安装路径、machine_id、last_version，
+/// 抹掉 machine_id 等于换了台新机器、历史日志全部对不上。
+pub fn save_auto_update_to_file(config_file: &PathBuf, enabled: bool) -> Result<(), String> {
+    let mut cfg: PathConfig = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        PathConfig::default()
+    };
+    cfg.auto_update = Some(enabled);
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let content =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("序列化配置失败: {}", e))?;
     fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
 }
 
@@ -1293,6 +1340,12 @@ fn try_add_firewall_rule_os(_port: u16) -> Result<String, String> {
 }
 
 /// 获取开机自启偏好，供前端/托盘菜单回显开关状态
+/// 供前端读取自动更新开关，决定要不要起轮询定时器
+#[tauri::command]
+fn get_auto_update() -> bool {
+    load_auto_update_from_file(&get_runtime_config_file())
+}
+
 #[tauri::command]
 fn get_autostart() -> bool {
     load_autostart_from_file(&get_runtime_config_file())
@@ -2029,6 +2082,7 @@ pub fn run() {
             save_custom_path,
             refresh_chrome_tabs,
             get_autostart,
+            get_auto_update,
             set_autostart,
             open_log_dir,
             get_log_server_port,
@@ -2075,6 +2129,17 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         load_autostart_from_file(&get_runtime_config_file()),
         None::<&str>,
     )?;
+    // 自动检查更新开关（2026-08-27）。默认关——测图标点击这类功能时，
+    // 机器在背后自动升级会重启客户端、打断测试。关掉后仍可点上面的
+    // 「立即检查更新」手动升级
+    let auto_update_item = CheckMenuItem::with_id(
+        app,
+        "toggle_auto_update",
+        "自动检查更新",
+        true,
+        load_auto_update_from_file(&get_runtime_config_file()),
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -2084,6 +2149,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             &check_item,
             &PredefinedMenuItem::separator(app)?,
             &autostart_item,
+            &auto_update_item,
             &PredefinedMenuItem::separator(app)?,
             &quit_item,
         ],
@@ -2131,6 +2197,27 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                         }
                     }
                     Err(e) => log_client_error(&format!("切换开机自启失败: {}", e)),
+                }
+            }
+            "toggle_auto_update" => {
+                let config_file = get_runtime_config_file();
+                let next = !load_auto_update_from_file(&config_file);
+                match save_auto_update_to_file(&config_file, next) {
+                    // 写盘成功才改勾选态，失败保持原状——避免显示与实际不符
+                    Ok(()) => {
+                        if let Some(item) = app.menu().and_then(|m| m.get("toggle_auto_update")) {
+                            if let Some(check) = item.as_check_menuitem() {
+                                let _ = check.set_checked(next);
+                            }
+                        }
+                        log_client_info(&format!(
+                            "[设置] 自动检查更新已{}",
+                            if next { "开启" } else { "关闭（仍可手动点「立即检查更新」）" }
+                        ));
+                        // 通知前端立即生效，不必等重启
+                        let _ = app.emit("auto-update-changed", next);
+                    }
+                    Err(e) => log_client_error(&format!("保存自动更新偏好失败: {}", e)),
                 }
             }
             "quit" => app.exit(0),
@@ -2471,6 +2558,67 @@ mod tests {
     // ─────────────────────────────────────────────────────────
     // Task 1.1 常驻化：开机自启偏好持久化
     // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_auto_update_defaults_to_disabled() {
+        // **默认关**（2026-08-27 用户拍板）。与 autostart 的默认关是同一种保守取向，
+        // 但代价不同、必须说清：
+        //
+        // autostart 默认关只是「不改用户的开机项」，没有后果；
+        // 而自动更新默认关意味着**新装的机器永远停在安装时那个版本**——
+        // 发了修复版也不会自己升上去，除非有人手动点「立即检查更新」。
+        //
+        // 2026-08-24 刚经历过一次「自动更新链路坏了 6 天没人发现」（CDN 对
+        // octet-stream 返回 500），当时的教训正是「静默不升级最难察觉」。
+        // 故这个默认值必须配一个显眼的界面提示，见巡检页顶部的告警条。
+        let config_file = PathBuf::from("/tmp/non_existent_autoupdate_98765/config.json");
+        assert_eq!(
+            load_auto_update_from_file(&config_file),
+            false,
+            "配置缺失时自动更新必须默认关闭（用户 2026-08-27 拍板）"
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_auto_update() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+
+        save_auto_update_to_file(&config_file, true).expect("开启自动更新失败");
+        assert_eq!(
+            load_auto_update_from_file(&config_file),
+            true,
+            "开启后读不到，会导致托盘勾选状态与实际行为不符"
+        );
+
+        save_auto_update_to_file(&config_file, false).expect("关闭自动更新失败");
+        assert_eq!(
+            load_auto_update_from_file(&config_file),
+            false,
+            "关不掉的话，测试期间机器仍会在背后升级并重启客户端"
+        );
+    }
+
+    #[test]
+    fn test_auto_update_preserves_other_config() {
+        // config.json 里还有安装路径、machine_id、last_version。写这个开关时
+        // 抹掉它们的后果：用户自定义安装路径丢失、machine_id 重新生成
+        // （等于换了台新机器，历史日志全部对不上）
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+
+        save_path_to_config_file(&config_file, "online", "/custom/aichat").expect("保存路径失败");
+        save_autostart_to_file(&config_file, true).expect("保存自启失败");
+        save_auto_update_to_file(&config_file, false).expect("保存自动更新偏好失败");
+
+        assert_eq!(
+            load_saved_path_from_file(&config_file, "online"),
+            Some("/custom/aichat".to_string()),
+            "安装路径被抹掉了"
+        );
+        assert_eq!(load_autostart_from_file(&config_file), true, "自启偏好被抹掉了");
+        assert_eq!(load_auto_update_from_file(&config_file), false);
+    }
 
     #[test]
     fn test_autostart_defaults_to_disabled_when_config_missing() {
