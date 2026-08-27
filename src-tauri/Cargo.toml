@@ -1,6 +1,6 @@
 [package]
 name = "aichat-updater"
-version = "0.4.5"
+version = "0.4.6"
 description = "aichat Plugin Updater"
 authors = ["you"]
 edition = "2021"

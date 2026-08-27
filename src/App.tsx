@@ -526,6 +526,37 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
+  /// 点 Chrome 工具栏上的插件图标（领导给的方案，走图像识别 + 模拟鼠标）。
+  ///
+  /// # 为什么要二次确认
+  /// 它和那四个指令按钮性质完全不同：那些是通过心跳通道发给某个实例、
+  /// 互不影响；这个会**把 Chrome 抢到最前并移动真实鼠标**，一台机器上
+  /// 跑着 8~10 个实例、插件正往供应商聊天框打字时，按键会落到别处或丢字。
+  ///
+  /// 所以点之前要让人确认「现在这台机器可以被打断」。
+  async function clickPluginIcon() {
+    const ok = window.confirm(
+      "点插件图标会做两件有副作用的事：\n\n" +
+        "1. 把 Chrome 窗口抢到最前（夺走焦点）\n" +
+        "2. 移动真实鼠标指针并点击\n\n" +
+        "如果这台机器上有实例正在往供应商聊天框输入文字，会被打断、\n" +
+        "按键可能落到别处。确认现在可以打断吗？",
+    );
+    if (!ok) return;
+    setSendingCmd("icon");
+    setPatrolHint("正在识别并点击插件图标…（约需 1~2 秒）");
+    try {
+      const msg = await invoke<string>("click_plugin_icon");
+      setPatrolHint(msg);
+    } catch (e) {
+      // 失败原因对排查有用（没找到图标 = 可能要重截模板；没装 Python 等），
+      // 原样显示，不要吞成一句「操作失败」
+      setPatrolHint(`点击失败：${e}`);
+    } finally {
+      setSendingCmd(null);
+    }
+  }
+
   /// 向某个插件实例下发一条指令。
   ///
   /// # 提示语为什么强调「已下发」而不是「已完成」
@@ -971,6 +1002,24 @@ function App() {
                 `（${patrol?.minimizedWindows} 个已最小化）`}
             </span>
             {patrolHint && <span className="patrol-hint">{patrolHint}</span>}
+            {/*
+              点插件图标（DEV-125034）。放在页面顶部而非每行，因为它与那四个
+              按钮性质不同：
+              - 那四个是**发指令给某个实例**，通过心跳通道，不影响别的实例
+              - 这个是**在这台机器上模拟真实鼠标点击**，整机级、会抢焦点
+
+              侧边栏关掉后无法由代码重开（Chrome 强制 sidePanel.open() 必须
+              用户手势），点图标是目前唯一可能自动化的路径。代价写在按钮上，
+              让点的人知道自己在做什么。
+            */}
+            <button
+              className="patrol-btn patrol-btn-danger patrol-icon-btn"
+              disabled={sendingCmd !== null}
+              onClick={clickPluginIcon}
+              title="用图像识别找到 Chrome 工具栏上的插件图标并模拟鼠标点击，用于打开侧边栏。⚠️ 会把 Chrome 窗口抢到最前并移动鼠标，可能打断其它实例正在进行的聊天输入"
+            >
+              点插件图标
+            </button>
           </div>
           <div className="log-table-wrap">
             {!patrol || patrol.instances.length === 0 ? (
