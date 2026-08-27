@@ -219,6 +219,10 @@ function App() {
   // 手动检查更新的状态与反馈（自动轮询不产生这些提示）
   const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
   const [selfUpdateHint, setSelfUpdateHint] = useState<string>("");
+  // 自动检查更新是否开启（默认关）。关闭时巡检页顶部显示提示——
+  // 「关了忘记开」是这类开关的典型问题，而静默不升级最难察觉
+  // （2026-08-24 刚踩过自动更新坏了 6 天没人发现）
+  const [autoUpdate, setAutoUpdate] = useState<boolean>(false);
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
@@ -244,9 +248,33 @@ function App() {
     if (selfUpdateStarted) return;
     selfUpdateStarted = true;
 
-    runSelfUpdateCheck("auto");
-    const timer = setInterval(() => runSelfUpdateCheck("auto"), SELF_UPDATE_INTERVAL_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    // 自动检查更新默认关（2026-08-27）。开关在托盘菜单，存 config.json。
+    // 关掉时连启动那次检查也不做——测试期间不希望机器在背后升级、
+    // 重启客户端打断测试，而启动检查恰好发生在最容易被忽略的时刻
+    const start = (enabled: boolean) => {
+      setAutoUpdate(enabled);
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      if (!enabled) return;
+      runSelfUpdateCheck("auto");
+      timer = setInterval(() => runSelfUpdateCheck("auto"), SELF_UPDATE_INTERVAL_MS);
+    };
+
+    invoke<boolean>("get_auto_update")
+      .then(start)
+      // 读不到偏好时按「关」处理：宁可不升级也不要在用户以为关着的时候偷偷升
+      .catch(() => start(false));
+
+    // 托盘里改了开关立即生效，不必重启客户端
+    const un = listen<boolean>("auto-update-changed", (e) => start(e.payload));
+    return () => {
+      if (timer) clearInterval(timer);
+      void un.then((f) => f());
+    };
   }, []);
 
   /// 执行一次自更新检查。
@@ -709,6 +737,24 @@ function App() {
         {/* 当前版本常驻显示：排查多台机器时不必再去翻日志 */}
         {appVersion && (
           <span className="app-version">
+            {/*
+              自动更新关闭时常驻提示（2026-08-27）。
+              放在版本号旁边而不是某个页面里——关掉影响的是整个客户端，
+              任何页面都该看得见。
+
+              为什么非要有这个提示：默认关意味着新装的机器永远停在安装时
+              那个版本，而「关了忘记开」是这类开关的典型问题。2026-08-24 刚
+              经历过「自动更新链路坏了 6 天没人发现」，静默不升级同样难察觉。
+              紧挨着「检查更新」按钮，看到提示就知道该点哪儿。
+            */}
+            {!autoUpdate && (
+              <span
+                className="auto-update-off"
+                title="自动检查更新已关闭（托盘菜单可开启）。当前版本不会自动升级，需手动点「检查更新」"
+              >
+                自动更新已关
+              </span>
+            )}
             <button
               className="check-update-btn"
               onClick={() => runSelfUpdateCheck("manual")}
