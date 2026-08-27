@@ -219,6 +219,10 @@ function App() {
   // 手动检查更新的状态与反馈（自动轮询不产生这些提示）
   const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
   const [selfUpdateHint, setSelfUpdateHint] = useState<string>("");
+  // 自动检查更新是否开启（默认关）。关闭时巡检页顶部显示提示——
+  // 「关了忘记开」是这类开关的典型问题，而静默不升级最难察觉
+  // （2026-08-24 刚踩过自动更新坏了 6 天没人发现）
+  const [autoUpdate, setAutoUpdate] = useState<boolean>(false);
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
@@ -244,9 +248,33 @@ function App() {
     if (selfUpdateStarted) return;
     selfUpdateStarted = true;
 
-    runSelfUpdateCheck("auto");
-    const timer = setInterval(() => runSelfUpdateCheck("auto"), SELF_UPDATE_INTERVAL_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    // 自动检查更新默认关（2026-08-27）。开关在托盘菜单，存 config.json。
+    // 关掉时连启动那次检查也不做——测试期间不希望机器在背后升级、
+    // 重启客户端打断测试，而启动检查恰好发生在最容易被忽略的时刻
+    const start = (enabled: boolean) => {
+      setAutoUpdate(enabled);
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      if (!enabled) return;
+      runSelfUpdateCheck("auto");
+      timer = setInterval(() => runSelfUpdateCheck("auto"), SELF_UPDATE_INTERVAL_MS);
+    };
+
+    invoke<boolean>("get_auto_update")
+      .then(start)
+      // 读不到偏好时按「关」处理：宁可不升级也不要在用户以为关着的时候偷偷升
+      .catch(() => start(false));
+
+    // 托盘里改了开关立即生效，不必重启客户端
+    const un = listen<boolean>("auto-update-changed", (e) => start(e.payload));
+    return () => {
+      if (timer) clearInterval(timer);
+      void un.then((f) => f());
+    };
   }, []);
 
   /// 执行一次自更新检查。
@@ -498,6 +526,37 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
+  /// 点 Chrome 工具栏上的插件图标（领导给的方案，走图像识别 + 模拟鼠标）。
+  ///
+  /// # 为什么要二次确认
+  /// 它和那四个指令按钮性质完全不同：那些是通过心跳通道发给某个实例、
+  /// 互不影响；这个会**把 Chrome 抢到最前并移动真实鼠标**，一台机器上
+  /// 跑着 8~10 个实例、插件正往供应商聊天框打字时，按键会落到别处或丢字。
+  ///
+  /// 所以点之前要让人确认「现在这台机器可以被打断」。
+  async function clickPluginIcon() {
+    const ok = window.confirm(
+      "点插件图标会做两件有副作用的事：\n\n" +
+        "1. 把 Chrome 窗口抢到最前（夺走焦点）\n" +
+        "2. 移动真实鼠标指针并点击\n\n" +
+        "如果这台机器上有实例正在往供应商聊天框输入文字，会被打断、\n" +
+        "按键可能落到别处。确认现在可以打断吗？",
+    );
+    if (!ok) return;
+    setSendingCmd("icon");
+    setPatrolHint("正在识别并点击插件图标…（约需 1~2 秒）");
+    try {
+      const msg = await invoke<string>("click_plugin_icon");
+      setPatrolHint(msg);
+    } catch (e) {
+      // 失败原因对排查有用（没找到图标 = 可能要重截模板；没装 Python 等），
+      // 原样显示，不要吞成一句「操作失败」
+      setPatrolHint(`点击失败：${e}`);
+    } finally {
+      setSendingCmd(null);
+    }
+  }
+
   /// 向某个插件实例下发一条指令。
   ///
   /// # 提示语为什么强调「已下发」而不是「已完成」
@@ -709,6 +768,24 @@ function App() {
         {/* 当前版本常驻显示：排查多台机器时不必再去翻日志 */}
         {appVersion && (
           <span className="app-version">
+            {/*
+              自动更新关闭时常驻提示（2026-08-27）。
+              放在版本号旁边而不是某个页面里——关掉影响的是整个客户端，
+              任何页面都该看得见。
+
+              为什么非要有这个提示：默认关意味着新装的机器永远停在安装时
+              那个版本，而「关了忘记开」是这类开关的典型问题。2026-08-24 刚
+              经历过「自动更新链路坏了 6 天没人发现」，静默不升级同样难察觉。
+              紧挨着「检查更新」按钮，看到提示就知道该点哪儿。
+            */}
+            {!autoUpdate && (
+              <span
+                className="auto-update-off"
+                title="自动检查更新已关闭（托盘菜单可开启）。当前版本不会自动升级，需手动点「检查更新」"
+              >
+                自动更新已关
+              </span>
+            )}
             <button
               className="check-update-btn"
               onClick={() => runSelfUpdateCheck("manual")}
@@ -925,6 +1002,24 @@ function App() {
                 `（${patrol?.minimizedWindows} 个已最小化）`}
             </span>
             {patrolHint && <span className="patrol-hint">{patrolHint}</span>}
+            {/*
+              点插件图标（DEV-125034）。放在页面顶部而非每行，因为它与那四个
+              按钮性质不同：
+              - 那四个是**发指令给某个实例**，通过心跳通道，不影响别的实例
+              - 这个是**在这台机器上模拟真实鼠标点击**，整机级、会抢焦点
+
+              侧边栏关掉后无法由代码重开（Chrome 强制 sidePanel.open() 必须
+              用户手势），点图标是目前唯一可能自动化的路径。代价写在按钮上，
+              让点的人知道自己在做什么。
+            */}
+            <button
+              className="patrol-btn patrol-btn-danger patrol-icon-btn"
+              disabled={sendingCmd !== null}
+              onClick={clickPluginIcon}
+              title="用图像识别找到 Chrome 工具栏上的插件图标并模拟鼠标点击，用于打开侧边栏。⚠️ 会把 Chrome 窗口抢到最前并移动鼠标，可能打断其它实例正在进行的聊天输入"
+            >
+              点插件图标
+            </button>
           </div>
           <div className="log-table-wrap">
             {!patrol || patrol.instances.length === 0 ? (
