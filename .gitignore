@@ -22,6 +22,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-
-# 技能调用的大响应落盘目录（business-kb / it-kb 等），本地临时产物
-uploads/

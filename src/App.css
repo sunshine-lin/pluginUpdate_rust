@@ -1268,31 +1268,3 @@
     color: #999;
   }
 }
-
-/* 「点插件图标」按钮（DEV-125034）：放在巡检页顶部摘要行，与表格里每行的
-   四个指令按钮区分开——那些是发指令给单个实例、互不影响，这个是整机级
-   且会抢焦点。用 danger 配色 + 左侧留白，视觉上明确它不是同一类操作 */
-.patrol-icon-btn {
-  margin-left: auto;
-}
-
-/* 自动更新已关的常驻提示（2026-08-27）。
-   用琥珀色而非红色：这是用户主动关的、属于「需要知道」而非「出错了」，
-   刺眼的红会让人以为客户端坏了 */
-.auto-update-off {
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: #fff7e6;
-  border: 1px solid #ffd591;
-  color: #b26a00;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-@media (prefers-color-scheme: dark) {
-  .auto-update-off {
-    background: #3a2f1a;
-    border-color: #6b5420;
-    color: #e0b050;
-  }
-}
