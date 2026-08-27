@@ -1117,6 +1117,72 @@ pub fn build_firewall_rule_script_windows(port: u16) -> String {
 /// PowerShell 用 UTF-8 去解 GBK 字节，反而更糟。
 ///
 /// `$LASTEXITCODE` 必须在切编码之前取：中间任何一条命令都会覆盖它。
+/// 构建调用图标定位脚本的参数（纯函数，可测）。
+///
+/// 对应 `docs/chatgpt-icon-locator/README.md` 里推荐的「方案 A，一步到位」：
+/// `--activate --click` —— 激活 Chrome、找到图标、直接点。
+///
+/// # 为什么用 --activate
+/// 脚本靠**整屏截图**做模板匹配，目标窗口被遮挡时截图上根本没有那个图标。
+/// `--activate` 先把它抬到最前，是识别得以成立的前提，不是可选项。
+///
+/// # 已知代价（领导方案的既有属性，接入时如实保留）
+/// `--activate` 内部会敲 Alt 越过前台锁 + SetForegroundWindow 抢前台，
+/// `--click` 会 SetCursorPos 移动真实鼠标 + mouse_event 物理点击。
+/// 一台机器跑 8~10 个实例时，抢焦点会打断其它实例正在进行的聊天输入。
+pub fn build_icon_click_command(script_path: &str) -> String {
+    format!(
+        "\"{}\" --activate --activate-match \"Google Chrome\" --click",
+        script_path
+    )
+}
+
+/// 解析图标定位脚本的执行结果（纯函数，可测）。
+///
+/// 脚本的输出契约（见其 README）：
+///
+/// | 情况 | stdout | 退出码 |
+/// |---|---|---|
+/// | 找到 | 一行 `x,y`（物理像素绝对坐标） | 0 |
+/// | 没找到（置信度低于阈值） | 空，stderr 打印 NOT_FOUND | 2 |
+/// | 出错（模板缺失/无 Chrome 窗口） | 空，stderr 打印 ERROR | 1 |
+///
+/// stdout 解析不出坐标时返回错误而非 `(0, 0)`：后者会让调用方以为点成功了，
+/// 而实际坐标指向屏幕左上角。
+pub fn parse_icon_click_result(
+    stdout: &str,
+    exit_code: i32,
+    stderr: &str,
+) -> Result<(i32, i32), String> {
+    match exit_code {
+        0 => {
+            let s = stdout.trim();
+            let (x, y) = s
+                .split_once(',')
+                .ok_or_else(|| format!("脚本输出无法解析为坐标: {:?}", s))?;
+            let x: i32 = x
+                .trim()
+                .parse()
+                .map_err(|_| format!("横坐标不是整数: {:?}", x))?;
+            let y: i32 = y
+                .trim()
+                .parse()
+                .map_err(|_| format!("纵坐标不是整数: {:?}", y))?;
+            Ok((x, y))
+        }
+        2 => Err(format!(
+            "未找到插件图标（置信度低于阈值）。可能是图标改版、分辨率变化，\
+             需在该机器上重新截取模板图。脚本输出: {}",
+            stderr.trim()
+        )),
+        1 => Err(format!(
+            "脚本执行出错（模板文件缺失，或找不到 Chrome 窗口）: {}",
+            stderr.trim()
+        )),
+        c => Err(format!("脚本返回未知退出码 {}: {}", c, stderr.trim())),
+    }
+}
+
 pub fn build_firewall_powershell_script(port: u16) -> String {
     format!(
         "$ErrorActionPreference='SilentlyContinue'; \
@@ -1557,6 +1623,91 @@ fn validate_plugin_command(kind: &str) -> Result<(), String> {
 /// 本轮不接任何自动判定。两次教训都出在自动触发上：抢焦点（2026-08-21 砍掉
 /// 自动拉起侧边栏）、登录死循环（插件侧回滚 9ef8533e）。人点一次是单发，
 /// 形不成放大环；要接自动触发得逐条重新评估。
+/// 点击 Chrome 工具栏上的插件图标（领导给的方案）。
+///
+/// 调用 `resources/icon-locator/aichat_icon_locator.py`：整屏截图 + OpenCV
+/// 多尺度模板匹配定位图标，然后模拟鼠标点击。脚本原样保留，这里只做薄封装。
+///
+/// # 目的
+/// 侧边栏关掉后无法由代码重新打开（Chrome 强制 `sidePanel.open()` 必须用户
+/// 手势），只能靠「点插件图标」这个真实鼠标动作。这是目前唯一可能自动化的路径。
+///
+/// # ⚠️ 会抢焦点（已知，按指示先走通再评估）
+/// 脚本内部 `SetForegroundWindow` 抢前台 + `SetCursorPos`/`mouse_event` 物理
+/// 点击。一台机器跑 8~10 个实例时，抢焦点会打断其它实例正在进行的聊天输入
+/// ——这是 2026-08-21 停用自动拉起侧边栏的同一条风险。
+///
+/// 故本命令**只允许人工点击触发**，且界面上必须写清代价。
+///
+/// # 已知限制（多实例场景）
+/// 脚本在**整个虚拟桌面**上取匹配分数最高的**一个**图标。一台机器开着
+/// 8~10 个 Chrome 窗口、每个都有同样的图标时，它返回的是「最像模板的那个」，
+/// 不是「你要的那个」。`--activate` 也不解决——其它窗口的图标仍在屏幕上。
+/// 走通后需评估这一点是否可接受。
+#[tauri::command]
+async fn click_plugin_icon(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Manager;
+    let script = app
+        .path()
+        .resolve(
+            "resources/icon-locator/aichat_icon_locator.py",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("找不到图标定位脚本: {}", e))?;
+    if !script.exists() {
+        return Err(format!(
+            "图标定位脚本不存在: {:?}。该脚本随安装包分发，开发模式下需确认 \
+             src-tauri/resources/icon-locator/ 已就位",
+            script
+        ));
+    }
+    let script_str = script.to_string_lossy().to_string();
+    log_client_info(&format!("[图标点击] 调用脚本: {}", script_str));
+
+    let (stdout, stderr, code) = run_icon_locator_os(&script_str)?;
+    match parse_icon_click_result(&stdout, code, &stderr) {
+        Ok((x, y)) => {
+            log_client_info(&format!("[图标点击] 已点击 ({}, {})", x, y));
+            Ok(format!("已点击插件图标，坐标 ({}, {})", x, y))
+        }
+        Err(e) => {
+            log_client_error(&format!("[图标点击] 失败: {}", e));
+            Err(e)
+        }
+    }
+}
+
+/// 执行图标定位脚本，返回 (stdout, stderr, 退出码)。
+///
+/// Windows 用 `python`（目标机器的 Python 3.10 自带 cv2/numpy/Pillow，
+/// 见脚本 README）。**不能加 CREATE_NO_WINDOW**——脚本本身就要抢前台
+/// 才能截到图，隐藏控制台窗口不改变这一点，反而让人看不到它在跑。
+#[cfg(target_os = "windows")]
+fn run_icon_locator_os(script: &str) -> Result<(String, String, i32), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let args = build_icon_click_command(script);
+    // 走 cmd 是为了让 `python` 走 PATH 解析（目标机器装在 Program Files 下）
+    let output = std::process::Command::new("cmd")
+        .args(["/C", &format!("python {}", args)])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("启动 python 失败（目标机器是否装了 Python 3.10？）: {}", e))?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
+/// 非 Windows 平台不支持：脚本全是 ctypes.windll 的 Win32 调用
+/// （SetForegroundWindow / SetCursorPos / mouse_event），在 macOS 上
+/// 连 import 都过不了。采购机器全是 Windows，本分支仅供本机开发时不报错。
+#[cfg(not(target_os = "windows"))]
+fn run_icon_locator_os(_script: &str) -> Result<(String, String, i32), String> {
+    Err("图标点击只支持 Windows（脚本依赖 Win32 API），当前系统不可用".to_string())
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -2093,6 +2244,7 @@ pub fn run() {
             log_self_update_progress,
             diagnose_download_url,
             send_plugin_command,
+            click_plugin_icon,
             list_log_dates,
             read_log_entries,
             read_log_page,
@@ -3437,6 +3589,85 @@ mod tests {
             Some(200),
             "同一地址不带 Accept 应返回 200——这个对比正是根因判定的依据"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 点插件图标（领导给的方案：模板匹配定位 + 点击）
+    //
+    // 背景：领导发来 docs/chatgpt-icon-locator，用 OpenCV 多尺度模板匹配
+    // 在 Chrome 工具栏上找扩展图标并点击。这里只做**薄封装**——不篡改
+    // 脚本逻辑，只把参数拼好、跑起来、按契约解析结果。
+    //
+    // ⚠️ 已知问题但按用户指示先走通：脚本会 SetForegroundWindow 抢前台
+    // + SetCursorPos/mouse_event 物理点击。这在单窗口 RPA 场景没问题，
+    // 但我们是 8~10 实例并行，抢焦点会打断正在输入的实例。此为领导
+    // 方案的既有属性，接入时如实保留，走通后再评估冲突。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_icon_click_command_include_activate_and_click() {
+        // 理想的一条命令（README 里写的）：激活 Chrome + 找到图标 + 直接点。
+        // 不传 python 路径（用 PATH），只传脚本参数；脚本路径由调用方注入
+        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py");
+        // 在 Windows 上实际是 "python <script> --activate --click"，
+        // 这里只测脚本参数部分（Windows 分支会拼 python 前缀）
+        assert!(cmd.contains("--activate"), "必须先激活 Chrome——图标可能被其它窗口遮挡");
+        assert!(cmd.contains("--click"), "找到后要直接点，别把坐标传回来再转一手");
+        assert!(cmd.contains("--activate-match"), "要指定挑哪个 Chrome 窗口");
+    }
+
+    #[test]
+    fn test_icon_locator_resources_exist_and_agree() {
+        // 三处必须一致：Rust 侧引用的脚本名、脚本里的默认模板名、实际文件。
+        // 不一致的表现是运行时才报「模板缺失」，而那时人已经在虚拟机前了。
+        //
+        // 领导给的原始脚本默认模板是 chatgpt_template.png（他自己的场景），
+        // 拿它去找我们的蓝色文档+放大镜图标必然 NOT_FOUND——换模板时若漏改
+        // 脚本里那行常量，症状就是「点了按钮永远说找不到」，很难联想到根因。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/icon-locator");
+        let script = dir.join("aichat_icon_locator.py");
+        let template = dir.join("aichat_template.png");
+        assert!(script.exists(), "脚本不存在: {:?}", script);
+        assert!(template.exists(), "模板图不存在: {:?}", template);
+
+        let src = fs::read_to_string(&script).expect("读取脚本");
+        assert!(
+            src.contains("aichat_template.png"),
+            "脚本里的 DEFAULT_TEMPLATE 没指向 aichat_template.png——\
+             会去找一个不存在的文件，运行时才报错"
+        );
+    }
+
+    #[test]
+    fn test_parse_icon_click_result_success() {
+        // 脚本契约：stdout 一行 x,y（物理像素绝对坐标），退出码 0
+        let r = parse_icon_click_result("1678,62", 0, "");
+        assert_eq!(r, Ok((1678, 62)), "标准输出是一行逗号分隔的坐标，解析后返回 (x,y)");
+    }
+
+    #[test]
+    fn test_parse_icon_click_result_not_found() {
+        // 退出码 2：置信度低于阈值，没找到。stdout 为空，错误在 stderr
+        let r = parse_icon_click_result("", 2, "NOT_FOUND confidence=0.42 (<0.55)");
+        assert!(r.is_err(), "退出码 2 = 没找到，这不是成功");
+        if let Err(e) = r {
+            assert!(e.contains("未找到"), "要明确指出是「没找到」而不是笼统的失败");
+        }
+    }
+
+    #[test]
+    fn test_parse_icon_click_result_script_error() {
+        // 退出码 1：脚本本身出错（模板缺失、没找到 Chrome 窗口等）
+        let r = parse_icon_click_result("", 1, "ERROR: template not found");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_parse_icon_click_result_garbled_stdout() {
+        // stdout 不是 x,y 形式（脚本被别的进程污染、或平台差异）——
+        // 应该报错，而不是静默返回 (0,0) 去点屏幕左上角
+        let r = parse_icon_click_result("hello world", 0, "");
+        assert!(r.is_err(), "无法解析成坐标时宁可失败，也不能乱点");
     }
 
     #[test]
