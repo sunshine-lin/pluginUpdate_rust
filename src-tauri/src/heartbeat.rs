@@ -174,6 +174,19 @@ pub enum HealAction {
     SidepanelClosedSilently,
 }
 
+/// 从插件名中提取用于自然排序的数字段。
+///
+/// 插件名形如 `10-2-LS10345`：把非数字字符当分隔符切分，每段数字转成
+/// u64，拼成一个 key 向量。`10-2` → `[10, 2, 10345]`，逐段比较就能让
+/// `10-2` 排在 `10-10` 之前——纯字符串比较做不到这一点（'2' > '1'）。
+/// 非数字或解析失败的段直接跳过，不让整体排序失败。
+pub fn plugin_name_sort_key(name: &str) -> Vec<u64> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
 /// 单个实例的巡检快照，供客户端界面展示（DEV-125034）。
 ///
 /// # 为什么需要它
@@ -286,10 +299,12 @@ impl HeartbeatRegistry {
         self.plugins.contains_key(plugin_name)
     }
 
-    /// 生成全部实例的巡检快照，异常的排在前面。
+    /// 生成全部实例的巡检快照，按插件名中的数字自然排序。
     ///
-    /// 排序规则：有问题的优先，其次按静默时长倒序，最后按名字——
-    /// 15 行表格里，需要处理的必须一眼看到，不该让人自己扫。
+    /// 插件名形如 `10-2-LS10345`（虚拟机号-序号-账号），字典序会把
+    /// `10-2` 排在 `10-10` 之后（'1' < '2'）。按名字里的数字段依次比较，
+    /// 保证同一台虚拟机的实例挨在一起、序号从小到大——采购同事要按虚拟机
+    /// 逐台核对，顺序乱了没法对着走。
     pub fn snapshots(&self, now: Instant) -> Vec<PluginSnapshot> {
         let mut list: Vec<PluginSnapshot> = self
             .plugins
@@ -325,9 +340,8 @@ impl HeartbeatRegistry {
             })
             .collect();
         list.sort_by(|a, b| {
-            b.has_issue
-                .cmp(&a.has_issue)
-                .then(b.silence_secs.cmp(&a.silence_secs))
+            plugin_name_sort_key(&a.plugin_name)
+                .cmp(&plugin_name_sort_key(&b.plugin_name))
                 .then(a.plugin_name.cmp(&b.plugin_name))
         });
         list
@@ -629,20 +643,39 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_puts_problem_instances_first() {
-        // 15 行表格里需要处理的必须一眼看到
+    fn test_snapshot_sorts_by_plugin_name_numbers() {
+        // 采购同事按虚拟机逐台核对，顺序必须是数字从小到大，
+        // 不能被字典序打乱（"10-2" 不能排到 "10-10" 后面），
+        // 也不能因为某台异常就被提到别的虚拟机前面
         let mut reg = HeartbeatRegistry::new();
         let now = Instant::now();
-        reg.on_heartbeat(&patrol_req("robot-01", Some(true), Some(true), None, None), now);
-        reg.on_heartbeat(&patrol_req("robot-02", Some(false), Some(true), None, None), now);
-        reg.on_heartbeat(&patrol_req("robot-03", Some(true), Some(true), None, None), now);
+        reg.on_heartbeat(
+            &patrol_req("10-10-LS10353", Some(true), Some(true), None, None),
+            now,
+        );
+        // 异常实例（侧边栏未开）：新排序下不应被提前
+        reg.on_heartbeat(
+            &patrol_req("10-2-LS10345", Some(false), Some(true), None, None),
+            now,
+        );
+        reg.on_heartbeat(
+            &patrol_req("2-1-LS10001", Some(true), Some(true), None, None),
+            now,
+        );
 
         let snaps = reg.snapshots(now);
         assert_eq!(
-            snaps[0].plugin_name, "robot-02",
-            "异常实例必须排在最前，实际顺序: {:?}",
-            snaps.iter().map(|s| &s.plugin_name).collect::<Vec<_>>()
+            snaps.iter().map(|s| s.plugin_name.as_str()).collect::<Vec<_>>(),
+            vec!["2-1-LS10001", "10-2-LS10345", "10-10-LS10353"],
+            "应按插件名中的数字从小到大排序，异常与否不影响顺序"
         );
+    }
+
+    #[test]
+    fn test_plugin_name_sort_key_parses_numeric_segments() {
+        assert_eq!(plugin_name_sort_key("10-2-LS10345"), vec![10, 2, 10345]);
+        assert_eq!(plugin_name_sort_key("2-1-LS10001"), vec![2, 1, 10001]);
+        assert_eq!(plugin_name_sort_key("unknown"), Vec::<u64>::new());
     }
 
     #[test]

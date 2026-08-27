@@ -504,21 +504,7 @@ function App() {
   /// 指令入队后要等插件**下次心跳**才被取走（最长 5 秒），执行成功才回 ack。
   /// 说成「已完成」会让人以为立刻生效了，而实际插件可能压根没接上——
   /// 真正的结果看巡检表格自己的变化（每 5 秒刷新）。
-  ///
-  /// # 「重载」为什么要二次确认
-  /// 它会销毁侧边栏，而侧边栏**无法由代码重新打开**（Chrome 强制用户手势），
-  /// 结果是插件活着但不能干活，必须有人到那台机器上手动点开。这个后果比
-  /// 「点错了再点回来」严重得多，值得挡一道。
   async function sendCommand(pluginName: string, kind: string) {
-    if (kind === "reload") {
-      const ok = window.confirm(
-        `确定要重载 ${pluginName} 吗？\n\n` +
-          `重载会关闭该实例的侧边栏，而侧边栏无法由程序重新打开——\n` +
-          `插件将无法处理任务，直到有人到那台机器上手动点开。\n\n` +
-          `如果只是想重置卡住的状态，请改用「刷新」。`,
-      );
-      if (!ok) return;
-    }
     const key = `${pluginName}:${kind}`;
     setSendingCmd(key);
     setPatrolHint(`正在向 ${pluginName} 下发 ${kind}…`);
@@ -922,7 +908,7 @@ function App() {
         </div>
       ) : view === "patrol" ? (
         /* 插件巡检看板（DEV-125034）：替代「逐个点开 15 个浏览器」的日常巡检。
-           异常实例已由后端排在最前，一眼能看到该处理谁 */
+           实例按插件名中的数字从小到大排序，方便对着虚拟机逐台核对 */
         <div className="patrol-view">
           <div className="patrol-summary">
             <span>
@@ -965,7 +951,7 @@ function App() {
                   {patrol.instances.map((it, idx) => (
                     <tr key={it.pluginName} className={it.hasIssue ? "patrol-row-issue" : ""}>
                       {/* 序号仅供口头指代（「第 3 行那台」），不是稳定标识——
-                          后端按「有异常的排前面」排序，同一台机器的序号会随状态变化 */}
+                          后端按插件名中的数字排序，实例增减时序号仍会变化 */}
                       <td className="patrol-index">{idx + 1}</td>
                       {/* 实例名可能被截断（表格不做横向滚动），title 里给全名 */}
                       <td className="patrol-name" title={it.pluginName}>
@@ -1051,7 +1037,7 @@ function App() {
                           className="patrol-btn patrol-btn-danger"
                           disabled={sendingCmd !== null}
                           onClick={() => sendCommand(it.pluginName, "reload")}
-                          title="重载插件：⚠️ 会关闭侧边栏且无法由代码重开，插件将无法干活直到有人手动打开——仅在侧边栏已经挂掉时使用"
+                          title="重载插件：会关闭侧边栏且无法由代码重开，插件将无法干活直到有人手动打开——仅在侧边栏已经挂掉时使用"
                         >
                           重载
                         </button>
