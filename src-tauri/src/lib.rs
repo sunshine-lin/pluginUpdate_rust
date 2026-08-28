@@ -1708,6 +1708,57 @@ fn run_icon_locator_os(_script: &str) -> Result<(String, String, i32), String> {
     Err("图标点击只支持 Windows（脚本依赖 Win32 API），当前系统不可用".to_string())
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 多实例图标定位：独立进程架构识别（DEV-125986）
+//
+// 真机实测确认采购机器存在两种 Chrome 架构，需要分别处理：
+// ①单进程多 Profile——Profile 已手动命名（如"10-2"），走 UI Automation
+//   读控件树即可拿到完整 plugin_name，全自动、不需要本节这套逻辑；
+// ②独立进程——各自 --user-data-dir 启动，目录名当初随意命名
+//   （如 User4/User5），与 plugin_name 之间没有客观对应关系，
+//   三者（快捷方式名/目录名/plugin_name）编号互相对不上、无法自动推导，
+//   需要人工做一次性映射确认（界面待实现），本节只负责解析出
+//   映射表的 key——即 --user-data-dir 的目录名。
+// ─────────────────────────────────────────────────────────────────
+
+/// 从 chrome.exe 进程命令行中提取 `--user-data-dir` 参数指向的目录名（最后一段）。
+///
+/// 用作独立进程架构下查映射表的 key。目录名而非完整路径是因为映射表要跟人工
+/// 在界面上填的 key 保持一致——完整路径太长、不同机器盘符也可能不同，
+/// 取最后一段目录名足够唯一且更适合人工核对。
+pub fn extract_user_data_dir_name(command_line: &str) -> Option<String> {
+    let marker = "--user-data-dir=";
+    let start = command_line.find(marker)? + marker.len();
+    let rest = &command_line[start..];
+
+    // 参数值可能带引号（路径含空格时 Chrome 会加），也可能不带
+    let value = if let Some(stripped) = rest.strip_prefix('"') {
+        stripped.split('"').next()?
+    } else {
+        // 不带引号时，值在下一个空格之前结束
+        rest.split(' ').next()?
+    };
+
+    let trimmed = value.trim_end_matches(['\\', '/']);
+    let name = trimmed.rsplit(['\\', '/']).next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// 判断一条 chrome.exe 命令行是否属于「浏览器主进程」而非子进程。
+///
+/// Chrome 多进程架构下，渲染进程/GPU 进程/网络进程等子进程命令行都带
+/// `--type=`，唯独主进程（Browser Process）没有——这是从
+/// `Get-CimInstance Win32_Process` 查到的一批 chrome.exe 里筛出
+/// 「每个实例真正的那一个主进程」的判据，子进程的 `--user-data-dir`
+/// 即使存在也不代表独立实例，不能拿去建映射。
+pub fn is_chrome_main_process_command_line(command_line: &str) -> bool {
+    !command_line.contains("--type=")
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -3785,6 +3836,75 @@ mod tests {
         assert!(
             !script.contains("dir=out"),
             "不应放行出站，避免超出「让 AI 读日志」这一必要范围"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 多实例图标定位：独立进程架构识别（DEV-125986）
+    //
+    // 背景：真机实测确认采购机器存在两种 Chrome 架构——
+    // ①单进程多 Profile（Profile 已手动命名如"10-2"，走 UI Automation
+    //   读控件树即可拿到完整 plugin_name，见另一组测试）；
+    // ②独立进程（各自 --user-data-dir 启动，目录名当初随意命名如
+    //   User4/User5，与 plugin_name 无客观对应关系，无法自动推导）。
+    //
+    // 本组测试覆盖②：从 chrome.exe 进程命令行里解析出 --user-data-dir
+    // 的目录名，作为后续查映射表的 key。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_user_data_dir_name_from_command_line() {
+        let cmd = r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="C:\MyChromeData\User4" --flag-switches-begin"#;
+        assert_eq!(
+            extract_user_data_dir_name(cmd),
+            Some("User4".to_string()),
+            "应取 --user-data-dir 路径的最后一段目录名作为映射表的 key"
+        );
+    }
+
+    #[test]
+    fn test_extract_user_data_dir_name_trailing_slash() {
+        // 路径末尾带斜杠时，最后一段不能读成空字符串
+        let cmd = r#""chrome.exe" --user-data-dir="C:\MyChromeData\User5\" --other-flag"#;
+        assert_eq!(
+            extract_user_data_dir_name(cmd),
+            Some("User5".to_string()),
+            "末尾斜杠应被忽略，不能取到空字符串"
+        );
+    }
+
+    #[test]
+    fn test_extract_user_data_dir_name_missing_returns_none() {
+        // 子进程（渲染进程等）命令行里没有这个参数，必须返回 None 而不是 panic
+        let cmd = r#""chrome.exe" --type=renderer --extension-process --lang=zh-CN"#;
+        assert_eq!(
+            extract_user_data_dir_name(cmd),
+            None,
+            "没有 --user-data-dir 参数时应返回 None，不能误判成某个无关字段"
+        );
+    }
+
+    #[test]
+    fn test_extract_user_data_dir_name_unquoted_value() {
+        // 命令行里该参数值不一定带引号（无空格路径时 Chrome 不会加引号）
+        let cmd = r#""chrome.exe" --user-data-dir=C:\MyChromeData\User6 --flag-switches-end"#;
+        assert_eq!(
+            extract_user_data_dir_name(cmd),
+            Some("User6".to_string()),
+            "不带引号的参数值也要能解析"
+        );
+    }
+
+    #[test]
+    fn test_is_chrome_main_process_command_line() {
+        // 主进程（浏览器进程）命令行不带 --type=，子进程都带。
+        // 用于从 Get-CimInstance 查到的一批 chrome.exe 里筛出主进程
+        let main = r#""chrome.exe" --user-data-dir="C:\MyChromeData\User4" --flag-switches-begin --flag-switches-end"#;
+        let renderer = r#""chrome.exe" --type=renderer --extension-process --lang=zh-CN"#;
+        assert!(is_chrome_main_process_command_line(main), "不带 --type= 的是主进程");
+        assert!(
+            !is_chrome_main_process_command_line(renderer),
+            "带 --type= 的是子进程（渲染/GPU/网络等），不是要找的浏览器主进程"
         );
     }
 }
