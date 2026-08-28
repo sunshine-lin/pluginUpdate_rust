@@ -1786,6 +1786,74 @@ pub fn resolve_lookup_strategy(
     }
 }
 
+/// 构建 UI Automation 探测脚本：遍历所有 Chrome 顶层窗口，从控件树里
+/// 读出 (HWND, plugin_name) 对。
+///
+/// 走 PowerShell + `System.Windows.Automation`（而非 Rust `windows` crate
+/// 直接调 Win32 API）：跟项目里图标定位、防火墙规则等其它 Windows 交互
+/// 保持同一套模式（Rust 拼脚本字符串 → `std::process::Command` 执行 →
+/// 解析 stdout），且这段脚本已在真机（10号机，8个 Profile）验证过能
+/// 读到目标数据，不需要再踩 FFI 绑定的坑。
+///
+/// 只对 Name 匹配 `<数字>-<数字>-<字母数字>` 这个 plugin_name 形状的
+/// 控件输出，避免把无关的按钮/菜单项文本也当成候选传回来。
+pub fn build_ui_automation_probe_script() -> String {
+    r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$condition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ClassNameProperty, "Chrome_WidgetWin_1"
+)
+$chromeWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
+foreach ($win in $chromeWindows) {
+    $hwnd = $win.Current.NativeWindowHandle
+    $allCondition = [System.Windows.Automation.Condition]::TrueCondition
+    $descendants = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $allCondition)
+    foreach ($el in $descendants) {
+        $name = $el.Current.Name
+        if ($name -match '^\d+-\d+-\w+$') {
+            Write-Output "$hwnd|$name"
+        }
+    }
+}
+"#
+    .to_string()
+}
+
+/// 解析 [`build_ui_automation_probe_script`] 的输出，得到 (HWND, plugin_name) 列表。
+///
+/// 容忍畸形行（跳过而非整体失败）：巡检场景下少一条数据远好过整个查询
+/// 报错。空输出（该架构未使用 Chrome 多用户 Profile 命名功能，或本次
+/// 恰好没有匹配到）返回空列表而非报错——调用方据此判断这条路径走不通，
+/// 转而检查映射表。
+pub fn parse_ui_automation_probe_output(output: &str) -> Vec<(u64, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (hwnd, name) = line.trim().split_once('|')?;
+            let hwnd: u64 = hwnd.trim().parse().ok()?;
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some((hwnd, name.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// 在 UI Automation 探测得到的候选列表中，精确匹配目标 plugin_name 对应的 HWND。
+///
+/// 找不到时返回 `None` 而非猜一个近似值——点错实例比点不到更糟：点错会
+/// 打断一个无关实例的正在进行的操作，而点不到只是这次操作没生效。
+pub fn find_hwnd_for_plugin_name(windows: &[(u64, String)], plugin_name: &str) -> Option<u64> {
+    windows
+        .iter()
+        .find(|(_, name)| name == plugin_name)
+        .map(|(hwnd, _)| *hwnd)
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -3978,6 +4046,108 @@ mod tests {
             LookupStrategy::MappingTable("User5".to_string()),
             "必须按 value（plugin_name）反查对应的 key（目录名），\
              不能假设调用方会传目录名进来"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // UI Automation 遍历（DEV-125986）：单进程多 Profile 架构下，
+    // 从 Chrome 窗口控件树里读出完整 plugin_name。
+    //
+    // 2026-08-28 真机验证（10号机，8个已命名 Profile）：遍历所有
+    // Chrome_WidgetWin_1 顶层窗口，对每个窗口做 UI Automation 子孙
+    // 遍历，能找到形如 [ControlType.Text] Name="10-2-LS10345" 的控件，
+    // Name 就是完整 plugin_name，不需要额外解析。
+    //
+    // 走 PowerShell 脚本模式（跟图标定位/防火墙规则等现有 Windows 交互
+    // 一致），不引入 windows crate：Rust 侧只负责拼脚本字符串和解析
+    // stdout，脚本本身就是真机验证过的那段。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_ui_automation_probe_script_contains_verified_logic() {
+        let script = build_ui_automation_probe_script();
+        assert!(
+            script.contains("Chrome_WidgetWin_1"),
+            "必须按这个类名筛选 Chrome 顶层窗口，这是真机验证过的窗口类名"
+        );
+        assert!(
+            script.contains("UIAutomationClient"),
+            "必须加载 UI Automation 客户端程序集才能用 AutomationElement"
+        );
+        assert!(
+            script.contains("TreeScope]::Descendants"),
+            "必须做子孙遍历（不能只看直接子节点），验证过目标控件在较深层级"
+        );
+        assert!(
+            script.contains("NativeWindowHandle"),
+            "必须带出每个窗口的 HWND，否则读到 plugin_name 也定位不到窗口"
+        );
+    }
+
+    #[test]
+    fn test_parse_ui_automation_probe_output_single_window() {
+        // 脚本输出契约：每行 "<HWND>|<Name>"，只保留看起来像 plugin_name
+        // 的行（脚本内部已用正则过滤，这里的解析函数只管拆分）
+        let output = "197304|10-2-LS10345\n262908|10-1-LS10344\n";
+        let result = parse_ui_automation_probe_output(output);
+        assert_eq!(
+            result,
+            vec![
+                (197304u64, "10-2-LS10345".to_string()),
+                (262908u64, "10-1-LS10344".to_string()),
+            ],
+            "应按行拆出 (HWND, plugin_name) 对，顺序与输出一致"
+        );
+    }
+
+    #[test]
+    fn test_parse_ui_automation_probe_output_empty() {
+        // 单进程多 Profile 架构但 Profile 未命名时，脚本会输出空——
+        // 不能 panic，应返回空列表，让调用方据此判断走不通这条路径
+        assert_eq!(
+            parse_ui_automation_probe_output(""),
+            Vec::<(u64, String)>::new(),
+            "空输出应返回空列表，不能 panic 或误判成有数据"
+        );
+    }
+
+    #[test]
+    fn test_parse_ui_automation_probe_output_skips_malformed_lines() {
+        // 容错：某一行格式异常时跳过而非整体失败——巡检场景下
+        // 少一条数据远好过整个查询报错
+        let output = "197304|10-2-LS10345\n畸形行没有分隔符\n262908|10-1-LS10344\n";
+        let result = parse_ui_automation_probe_output(output);
+        assert_eq!(
+            result,
+            vec![
+                (197304u64, "10-2-LS10345".to_string()),
+                (262908u64, "10-1-LS10344".to_string()),
+            ],
+            "畸形行应被跳过，不影响其它正常行的解析"
+        );
+    }
+
+    #[test]
+    fn test_find_hwnd_for_plugin_name_matches() {
+        let windows = vec![
+            (197304u64, "10-2-LS10345".to_string()),
+            (262908u64, "10-1-LS10344".to_string()),
+        ];
+        assert_eq!(
+            find_hwnd_for_plugin_name(&windows, "10-1-LS10344"),
+            Some(262908u64),
+            "应精确匹配 plugin_name 字符串，返回对应 HWND"
+        );
+    }
+
+    #[test]
+    fn test_find_hwnd_for_plugin_name_not_found() {
+        let windows = vec![(197304u64, "10-2-LS10345".to_string())];
+        assert_eq!(
+            find_hwnd_for_plugin_name(&windows, "10-9-不存在"),
+            None,
+            "找不到对应窗口时应返回 None，不能误配到别的实例上——\
+             那是比「点不到」更糟的「点错」"
         );
     }
 }
