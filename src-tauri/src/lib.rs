@@ -1759,6 +1759,33 @@ pub fn is_chrome_main_process_command_line(command_line: &str) -> bool {
     !command_line.contains("--type=")
 }
 
+/// 定位某个 plugin_name 对应窗口，该走哪条识别路径。
+///
+/// 映射表优先：它是人工确认过的、最不含糊的依据（独立进程架构，目录名
+/// 与 plugin_name 本无客观关联，映射表就是唯一的真相来源）。未命中时
+/// 回退到 UI Automation——多数机器是单进程多 Profile 架构，Profile 名
+/// 本就是完整 plugin_name，根本不需要维护映射表。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupStrategy {
+    /// 命中映射表，携带对应的 --user-data-dir 目录名（下一步用它去匹配
+    /// chrome.exe 进程的命令行）
+    MappingTable(String),
+    /// 未命中映射表，走 UI Automation 遍历窗口控件树
+    UiAutomation,
+}
+
+pub fn resolve_lookup_strategy(
+    plugin_name: &str,
+    mapping: &std::collections::HashMap<String, String>,
+) -> LookupStrategy {
+    // 映射表存的是 目录名 -> plugin_name，调用方给的是 plugin_name，
+    // 所以要按 value 反查对应的 key，不能假设调用方会传目录名进来
+    match mapping.iter().find(|(_, v)| v.as_str() == plugin_name) {
+        Some((dir_name, _)) => LookupStrategy::MappingTable(dir_name.clone()),
+        None => LookupStrategy::UiAutomation,
+    }
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -3905,6 +3932,52 @@ mod tests {
         assert!(
             !is_chrome_main_process_command_line(renderer),
             "带 --type= 的是子进程（渲染/GPU/网络等），不是要找的浏览器主进程"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 定位策略路由（DEV-125986）：给定 plugin_name，判断该走映射表
+    // 还是 UI Automation。纯决策逻辑，不碰任何 Windows API，是两条
+    // 识别路径的调度入口。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_lookup_strategy_uses_mapping_table_when_present() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("User4".to_string(), "10-4-LS10347".to_string());
+        assert_eq!(
+            resolve_lookup_strategy("10-4-LS10347", &map),
+            LookupStrategy::MappingTable("User4".to_string()),
+            "映射表里有该 plugin_name 的记录时，优先按映射表查（独立进程架构，最确定的路径）"
+        );
+    }
+
+    #[test]
+    fn test_resolve_lookup_strategy_falls_back_to_ui_automation() {
+        // 映射表里没有这个 plugin_name 时，尝试 UI Automation
+        // （对应单进程多 Profile 架构，Profile 名本就是完整 plugin_name，
+        // 不需要映射表）
+        let map = std::collections::HashMap::new();
+        assert_eq!(
+            resolve_lookup_strategy("10-2-LS10345", &map),
+            LookupStrategy::UiAutomation,
+            "映射表未命中时应回退到 UI Automation，而不是直接判定失败——\
+             很多机器（单进程多 Profile 架构）根本不需要映射表"
+        );
+    }
+
+    #[test]
+    fn test_resolve_lookup_strategy_mapping_table_lookup_is_by_plugin_name_not_key() {
+        // 映射表的 key 是目录名、value 才是 plugin_name——调用方传入的是
+        // plugin_name，函数内部要反向查找，而不是直接拿 plugin_name 当 key 查
+        let mut map = std::collections::HashMap::new();
+        map.insert("User4".to_string(), "10-4-LS10347".to_string());
+        map.insert("User5".to_string(), "10-5-LS10348".to_string());
+        assert_eq!(
+            resolve_lookup_strategy("10-5-LS10348", &map),
+            LookupStrategy::MappingTable("User5".to_string()),
+            "必须按 value（plugin_name）反查对应的 key（目录名），\
+             不能假设调用方会传目录名进来"
         );
     }
 }
