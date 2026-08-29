@@ -65,6 +65,22 @@ struct PathConfig {
     /// 故必须配显眼的界面提示——见巡检页顶部告警条。
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_update: Option<bool>,
+    /// 独立进程架构下，Chrome `--user-data-dir` 目录名 -> plugin_name
+    /// 的映射（DEV-125986）。
+    ///
+    /// # 为什么需要人工维护这张表
+    /// 真机实测确认：这类架构下，目录名（如 User4）与 plugin_name（如
+    /// 10-4-LS10347）之间没有任何程序能读到的客观对应关系——它们是各自
+    /// 独立的人工命名行为，三者（快捷方式名/目录名/plugin_name）编号
+    /// 互相对不上。UI Automation 那条路径（单进程多 Profile 架构）不
+    /// 需要这张表；只有这种「各实例各自 --user-data-dir 启动」的架构
+    /// 才需要——人工在界面上做一次性选择确认（不需要手写 JSON），此后
+    /// 除非该机器实例有变动才需要重新确认。
+    ///
+    /// 一次配置基本不变，跟 `machine_id` 同等对待，直接存进这份本机
+    /// 配置文件，不新建文件、不新增读写机制。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chrome_profile_mapping: Option<std::collections::HashMap<String, String>>,
     /// 透传本结构未声明的字段。serde 默认丢弃未知字段，
     /// 若不保留会在写入任一配置项时静默抹掉其它程序写入的数据
     #[serde(flatten)]
@@ -210,6 +226,46 @@ pub fn save_auto_update_to_file(config_file: &PathBuf, enabled: bool) -> Result<
         PathConfig::default()
     };
     cfg.auto_update = Some(enabled);
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let content =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("序列化配置失败: {}", e))?;
+    fs::write(config_file, content).map_err(|e| format!("写入配置文件失败: {}", e))
+}
+
+/// 读取独立进程架构的 Chrome Profile 映射表（DEV-125986）。
+///
+/// 配置缺失或未配置过时返回空表——空表是 [`resolve_lookup_strategy`]
+/// 的合法输入，会让所有 plugin_name 都回退到 UI Automation 路径，
+/// 不需要特殊处理「没有映射表」这个情况。
+pub fn load_chrome_profile_mapping(
+    config_file: &PathBuf,
+) -> std::collections::HashMap<String, String> {
+    fs::read_to_string(config_file)
+        .ok()
+        .and_then(|c| serde_json::from_str::<PathConfig>(&c).ok())
+        .and_then(|cfg| cfg.chrome_profile_mapping)
+        .unwrap_or_default()
+}
+
+/// 写入 Chrome Profile 映射表（保留其它字段不变），整体覆盖而非合并。
+///
+/// 整体覆盖是有意为之：人工每次重新走确认界面，应该以那一轮的结果为
+/// 准——合并会让已下线实例的旧映射永久残留，误导后续查询。
+pub fn save_chrome_profile_mapping(
+    config_file: &PathBuf,
+    mapping: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let mut cfg: PathConfig = if config_file.exists() {
+        fs::read_to_string(config_file)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        PathConfig::default()
+    };
+    cfg.chrome_profile_mapping = Some(mapping.clone());
     if let Some(parent) = config_file.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
     }
@@ -1130,11 +1186,33 @@ pub fn build_firewall_rule_script_windows(port: u16) -> String {
 /// `--activate` 内部会敲 Alt 越过前台锁 + SetForegroundWindow 抢前台，
 /// `--click` 会 SetCursorPos 移动真实鼠标 + mouse_event 物理点击。
 /// 一台机器跑 8~10 个实例时，抢焦点会打断其它实例正在进行的聊天输入。
-pub fn build_icon_click_command(script_path: &str) -> String {
-    format!(
-        "\"{}\" --activate --activate-match \"Google Chrome\" --click",
-        script_path
-    )
+///
+/// # 精确定位（DEV-125986）
+/// 传入 `target` 时，改用 `--hwnd`（精确指定要激活的窗口，替代模糊的
+/// `--activate-match` 标题匹配）+ `--region`（把匹配范围收窄到该窗口，
+/// 替代全屏扫描）。`target` 为 `None` 时保持原有全屏 + 标题匹配行为，
+/// 用于识别路径两条都没能定位到目标窗口时的兜底（宁可按旧逻辑赌一次，
+/// 也不是直接放弃不点）。
+pub fn build_icon_click_command(script_path: &str, target: Option<&IconClickTarget>) -> String {
+    match target {
+        Some(t) => format!(
+            "\"{}\" --activate --hwnd {} --region {},{},{},{} --click",
+            script_path, t.hwnd, t.region.0, t.region.1, t.region.2, t.region.3
+        ),
+        None => format!(
+            "\"{}\" --activate --activate-match \"Google Chrome\" --click",
+            script_path
+        ),
+    }
+}
+
+/// 精确点击目标：已定位到的窗口句柄 + 该窗口在屏幕上的矩形（虚拟桌面
+/// 绝对坐标，(left, top, width, height)，与 Win32 `GetWindowRect` 同
+/// 坐标系）。有了这两项，脚本不再需要全屏扫描 + 标题匹配去猜。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconClickTarget {
+    pub hwnd: u64,
+    pub region: (i32, i32, i32, i32),
 }
 
 /// 解析图标定位脚本的执行结果（纯函数，可测）。
@@ -1580,6 +1658,75 @@ fn get_patrol_report() -> Result<PatrolReport, String> {
     })
 }
 
+/// Chrome Profile 映射表确认界面用的候选数据（DEV-125986）。
+///
+/// 独立进程架构下，目录名与 plugin_name 之间无法自动推导对应关系，
+/// 需要人工在界面上做一次性选择确认——本结构就是界面要展示的两列，
+/// 加上已经保存过的映射（用于预填，不用每次从头选）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChromeProfileCandidates {
+    /// 当前检测到的 chrome.exe 主进程 user-data-dir 目录名
+    directory_names: Vec<String>,
+    /// 当前心跳在线的 plugin_name
+    online_plugin_names: Vec<String>,
+    /// 已保存的映射（目录名 -> plugin_name），用于界面预填
+    saved_mapping: std::collections::HashMap<String, String>,
+}
+
+/// 读取映射表确认界面所需的候选数据。
+#[tauri::command]
+fn get_chrome_profile_candidates() -> Result<ChromeProfileCandidates, String> {
+    let directory_names = list_chrome_user_data_dir_names_os().unwrap_or_default();
+    let online_plugin_names = match HEARTBEATS.get() {
+        Some(reg) => match reg.lock() {
+            Ok(r) => r
+                .snapshots(std::time::Instant::now())
+                .into_iter()
+                .map(|s| s.plugin_name)
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let saved_mapping = load_chrome_profile_mapping(&get_runtime_config_file());
+    Ok(ChromeProfileCandidates {
+        directory_names,
+        online_plugin_names,
+        saved_mapping,
+    })
+}
+
+/// 保存人工在映射表确认界面里选定的对应关系。
+///
+/// 整体覆盖（见 [`save_chrome_profile_mapping`] 文档）：每次都以这一轮
+/// 确认的结果为准，不与历史映射合并。
+#[tauri::command]
+fn save_chrome_profile_mapping_cmd(
+    mapping: std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    save_chrome_profile_mapping(&get_runtime_config_file(), &mapping)?;
+    log_client_info(&format!("[Chrome映射] 已保存 {} 条映射", mapping.len()));
+    Ok(format!("已保存 {} 条映射", mapping.len()))
+}
+
+/// 枚举当前所有 chrome.exe 主进程的 `--user-data-dir` 目录名
+/// （DEV-125986，独立进程架构映射表确认界面用）。
+#[cfg(target_os = "windows")]
+fn list_chrome_user_data_dir_names_os() -> Result<Vec<String>, String> {
+    let script = build_list_chrome_main_processes_script();
+    let output = powershell_no_window(&script)
+        .output()
+        .map_err(|e| format!("枚举 Chrome 进程失败: {}", e))?;
+    let processes = parse_chrome_main_processes_output(&String::from_utf8_lossy(&output.stdout));
+    Ok(processes.into_iter().map(|(_, name)| name).collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_chrome_user_data_dir_names_os() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
 /// 客户端能下发给插件的指令白名单。
 ///
 /// # 为什么必须是白名单
@@ -1625,7 +1772,7 @@ fn validate_plugin_command(kind: &str) -> Result<(), String> {
 /// 形不成放大环；要接自动触发得逐条重新评估。
 /// 点击 Chrome 工具栏上的插件图标（领导给的方案）。
 ///
-/// 调用 `resources/icon-locator/aichat_icon_locator.py`：整屏截图 + OpenCV
+/// 调用 `resources/icon-locator/aichat_icon_locator.py`：截图 + OpenCV
 /// 多尺度模板匹配定位图标，然后模拟鼠标点击。脚本原样保留，这里只做薄封装。
 ///
 /// # 目的
@@ -1639,13 +1786,22 @@ fn validate_plugin_command(kind: &str) -> Result<(), String> {
 ///
 /// 故本命令**只允许人工点击触发**，且界面上必须写清代价。
 ///
-/// # 已知限制（多实例场景）
-/// 脚本在**整个虚拟桌面**上取匹配分数最高的**一个**图标。一台机器开着
-/// 8~10 个 Chrome 窗口、每个都有同样的图标时，它返回的是「最像模板的那个」，
-/// 不是「你要的那个」。`--activate` 也不解决——其它窗口的图标仍在屏幕上。
-/// 走通后需评估这一点是否可接受。
+/// # 多实例精确定位（DEV-125986）
+/// 传入 `plugin_name` 时，按 [`resolve_lookup_strategy`] 判断该走映射表
+/// 还是 UI Automation 定位到目标窗口的 HWND + 屏幕矩形，再传给脚本做
+/// `--hwnd`/`--region` 精确点击，不再无差别全屏扫描。
+///
+/// 两条路径都定位失败时（比如映射表指向的实例 Chrome 尚未启动、或该
+/// 机器既没配映射表也没有 Profile 命名），**回退到原有的全屏 + 标题
+/// 匹配行为**而不是直接报错——宁可按旧逻辑赌一次（单实例场景下这样
+/// 仍然可靠），也不因为新增的精确定位失败就让整个功能不可用。
+/// 不传 `plugin_name`（旧调用方式，或前端还没升级）时同样直接走这个
+/// 全屏兜底路径。
 #[tauri::command]
-async fn click_plugin_icon(app: tauri::AppHandle) -> Result<String, String> {
+async fn click_plugin_icon(
+    app: tauri::AppHandle,
+    plugin_name: Option<String>,
+) -> Result<String, String> {
     use tauri::Manager;
     let script = app
         .path()
@@ -1662,9 +1818,27 @@ async fn click_plugin_icon(app: tauri::AppHandle) -> Result<String, String> {
         ));
     }
     let script_str = script.to_string_lossy().to_string();
-    log_client_info(&format!("[图标点击] 调用脚本: {}", script_str));
 
-    let (stdout, stderr, code) = run_icon_locator_os(&script_str)?;
+    let target = match &plugin_name {
+        Some(name) => {
+            let t = locate_icon_click_target_os(name);
+            if t.is_none() {
+                log_client_info(&format!(
+                    "[图标点击] 未能精确定位实例 {}，回退到全屏扫描",
+                    name
+                ));
+            }
+            t
+        }
+        None => None,
+    };
+
+    log_client_info(&format!(
+        "[图标点击] 调用脚本: {}（target={:?}）",
+        script_str, target
+    ));
+
+    let (stdout, stderr, code) = run_icon_locator_os(&script_str, target.as_ref())?;
     match parse_icon_click_result(&stdout, code, &stderr) {
         Ok((x, y)) => {
             log_client_info(&format!("[图标点击] 已点击 ({}, {})", x, y));
@@ -1677,16 +1851,61 @@ async fn click_plugin_icon(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+/// 根据 plugin_name 定位目标窗口的 HWND + 屏幕矩形（DEV-125986）。
+///
+/// 按 [`resolve_lookup_strategy`] 分流：映射表命中走独立进程架构的
+/// 进程枚举链路，未命中走 UI Automation。任一环节失败都返回 `None`
+/// 而非报错——调用方据此回退到全屏扫描，不影响单实例场景的可用性。
+#[cfg(target_os = "windows")]
+fn locate_icon_click_target_os(plugin_name: &str) -> Option<IconClickTarget> {
+    let mapping = load_chrome_profile_mapping(&get_runtime_config_file());
+    let strategy = resolve_lookup_strategy(plugin_name, &mapping);
+    let hwnd = match strategy {
+        LookupStrategy::MappingTable(dir_name) => {
+            let script = build_list_chrome_main_processes_script();
+            let output = powershell_no_window(&script).output().ok()?;
+            let processes =
+                parse_chrome_main_processes_output(&String::from_utf8_lossy(&output.stdout));
+            let pid = find_pid_for_user_data_dir_name(&processes, &dir_name)?;
+            let script = build_window_handle_for_pid_script(pid);
+            let output = powershell_no_window(&script).output().ok()?;
+            parse_window_handle_for_pid_output(&String::from_utf8_lossy(&output.stdout))
+        }
+        LookupStrategy::UiAutomation => {
+            let script = build_ui_automation_probe_script();
+            let output = powershell_no_window(&script).output().ok()?;
+            let windows =
+                parse_ui_automation_probe_output(&String::from_utf8_lossy(&output.stdout));
+            find_hwnd_for_plugin_name(&windows, plugin_name)
+        }
+    }?;
+
+    let script = build_window_rect_script(hwnd);
+    let output = powershell_no_window(&script).output().ok()?;
+    let region = parse_window_rect_output(&String::from_utf8_lossy(&output.stdout))?;
+    Some(IconClickTarget { hwnd, region })
+}
+
+/// 非 Windows 平台无法定位（依赖 UI Automation / WMI 等 Win32 专属能力），
+/// 直接返回 None，由调用方回退到全屏扫描——本机开发调试用。
+#[cfg(not(target_os = "windows"))]
+fn locate_icon_click_target_os(_plugin_name: &str) -> Option<IconClickTarget> {
+    None
+}
+
 /// 执行图标定位脚本，返回 (stdout, stderr, 退出码)。
 ///
 /// Windows 用 `python`（目标机器的 Python 3.10 自带 cv2/numpy/Pillow，
 /// 见脚本 README）。**不能加 CREATE_NO_WINDOW**——脚本本身就要抢前台
 /// 才能截到图，隐藏控制台窗口不改变这一点，反而让人看不到它在跑。
 #[cfg(target_os = "windows")]
-fn run_icon_locator_os(script: &str) -> Result<(String, String, i32), String> {
+fn run_icon_locator_os(
+    script: &str,
+    target: Option<&IconClickTarget>,
+) -> Result<(String, String, i32), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let args = build_icon_click_command(script);
+    let args = build_icon_click_command(script, target);
     // 走 cmd 是为了让 `python` 走 PATH 解析（目标机器装在 Program Files 下）
     let output = std::process::Command::new("cmd")
         .args(["/C", &format!("python {}", args)])
@@ -1704,7 +1923,10 @@ fn run_icon_locator_os(script: &str) -> Result<(String, String, i32), String> {
 /// （SetForegroundWindow / SetCursorPos / mouse_event），在 macOS 上
 /// 连 import 都过不了。采购机器全是 Windows，本分支仅供本机开发时不报错。
 #[cfg(not(target_os = "windows"))]
-fn run_icon_locator_os(_script: &str) -> Result<(String, String, i32), String> {
+fn run_icon_locator_os(
+    _script: &str,
+    _target: Option<&IconClickTarget>,
+) -> Result<(String, String, i32), String> {
     Err("图标点击只支持 Windows（脚本依赖 Win32 API），当前系统不可用".to_string())
 }
 
@@ -1927,6 +2149,41 @@ pub fn parse_window_handle_for_pid_output(output: &str) -> Option<u64> {
         Ok(hwnd) => Some(hwnd),
         Err(_) => None,
     }
+}
+
+/// 构建查询指定 HWND 窗口矩形的 PowerShell 脚本。
+///
+/// 用 `GetWindowRect`（而非 `.Bounds` 之类的 .NET 包装）是因为它返回的
+/// 是虚拟桌面绝对坐标——跟图标定位脚本 `--region` 参数、以及采购机上
+/// 多屏场景的坐标系必须严格一致，用别的 API 容易在多屏/DPI 缩放下对不上。
+pub fn build_window_rect_script(hwnd: u64) -> String {
+    format!(
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; \
+         public struct RECT {{ public int Left; public int Top; public int Right; public int Bottom; }} \
+         public class Win32 {{ [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect); }}'; \
+         $rect = New-Object RECT; \
+         [Win32]::GetWindowRect([IntPtr]{}, [ref]$rect) | Out-Null; \
+         Write-Output \"$($rect.Left),$($rect.Top),$($rect.Right),$($rect.Bottom)\"",
+        hwnd
+    )
+}
+
+/// 解析 [`build_window_rect_script`] 的输出，转换成图标定位脚本
+/// `--region` 参数要的 (left, top, width, height) 格式。
+///
+/// `GetWindowRect` 原生返回右下角坐标而非宽高，转换在这里做一次，
+/// 调用方不需要关心这个差异。
+pub fn parse_window_rect_output(output: &str) -> Option<(i32, i32, i32, i32)> {
+    let parts: Vec<&str> = output.trim().split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let nums: Vec<i32> = parts.iter().filter_map(|p| p.trim().parse().ok()).collect();
+    if nums.len() != 4 {
+        return None;
+    }
+    let (left, top, right, bottom) = (nums[0], nums[1], nums[2], nums[3]);
+    Some((left, top, right - left, bottom - top))
 }
 
 #[tauri::command]
@@ -2471,6 +2728,8 @@ pub fn run() {
             read_log_page,
             get_system_snapshot,
             get_patrol_report,
+            get_chrome_profile_candidates,
+            save_chrome_profile_mapping_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3000,6 +3259,87 @@ mod tests {
             load_autostart_from_file(&config_file),
             false,
             "配置缺失时开机自启必须默认关闭，否则会在用户未同意的情况下静默修改开机项"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Chrome Profile 映射表持久化（DEV-125986 第7步）：独立进程架构下
+    // 人工确认的「目录名 -> plugin_name」对照，存进本机既有配置文件。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_chrome_profile_mapping_defaults_to_empty_when_config_missing() {
+        let config_file = PathBuf::from("/tmp/non_existent_mapping_13579/config.json");
+        assert!(
+            load_chrome_profile_mapping(&config_file).is_empty(),
+            "配置缺失时应返回空表，而不是 panic 或返回上次残留的旧数据"
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_chrome_profile_mapping() {
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert("User4".to_string(), "10-4-LS10347".to_string());
+        mapping.insert("User5".to_string(), "10-5-LS10348".to_string());
+
+        save_chrome_profile_mapping(&config_file, &mapping).expect("保存映射表失败");
+        assert_eq!(
+            load_chrome_profile_mapping(&config_file),
+            mapping,
+            "保存后应能原样读回，否则人工确认过的映射关系会丢失，\
+             每次都要重新走一遍确认界面"
+        );
+    }
+
+    #[test]
+    fn test_chrome_profile_mapping_preserves_other_config() {
+        // 跟 auto_update/autostart 同一份 config.json，写映射表时不能
+        // 抹掉安装路径、machine_id 等其它字段
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+
+        save_path_to_config_file(&config_file, "online", "/custom/aichat").expect("保存路径失败");
+        save_auto_update_to_file(&config_file, true).expect("保存自动更新偏好失败");
+
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert("User4".to_string(), "10-4-LS10347".to_string());
+        save_chrome_profile_mapping(&config_file, &mapping).expect("保存映射表失败");
+
+        assert_eq!(
+            load_saved_path_from_file(&config_file, "online"),
+            Some("/custom/aichat".to_string()),
+            "写映射表不该抹掉安装路径"
+        );
+        assert_eq!(
+            load_auto_update_from_file(&config_file),
+            true,
+            "写映射表不该抹掉自动更新偏好"
+        );
+    }
+
+    #[test]
+    fn test_save_chrome_profile_mapping_overwrites_previous_entries() {
+        // 重新走一遍确认界面（如新增实例）应整体覆盖旧表，不是逐项合并——
+        // 否则删除某个已下线实例的映射关系时，旧记录会一直残留
+        let tmp = TempDir::new().expect("创建临时目录失败");
+        let config_file = tmp.path().join("config.json");
+
+        let mut first = std::collections::HashMap::new();
+        first.insert("User4".to_string(), "10-4-LS10347".to_string());
+        first.insert("User5".to_string(), "10-5-LS10348".to_string());
+        save_chrome_profile_mapping(&config_file, &first).expect("首次保存失败");
+
+        let mut second = std::collections::HashMap::new();
+        second.insert("User4".to_string(), "10-4-LS10347".to_string());
+        save_chrome_profile_mapping(&config_file, &second).expect("二次保存失败");
+
+        assert_eq!(
+            load_chrome_profile_mapping(&config_file),
+            second,
+            "应整体覆盖为最新一次确认的结果，User5 的旧记录不能残留"
         );
     }
 
@@ -3829,12 +4169,35 @@ mod tests {
     fn test_build_icon_click_command_include_activate_and_click() {
         // 理想的一条命令（README 里写的）：激活 Chrome + 找到图标 + 直接点。
         // 不传 python 路径（用 PATH），只传脚本参数；脚本路径由调用方注入
-        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py");
+        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", None);
         // 在 Windows 上实际是 "python <script> --activate --click"，
         // 这里只测脚本参数部分（Windows 分支会拼 python 前缀）
         assert!(cmd.contains("--activate"), "必须先激活 Chrome——图标可能被其它窗口遮挡");
         assert!(cmd.contains("--click"), "找到后要直接点，别把坐标传回来再转一手");
         assert!(cmd.contains("--activate-match"), "要指定挑哪个 Chrome 窗口");
+    }
+
+    #[test]
+    fn test_build_icon_click_command_with_target_uses_hwnd_and_region() {
+        // DEV-125986：给定精确定位到的目标（HWND + 窗口矩形）时，
+        // 命令应该用 --hwnd 精确激活、用 --region 限定匹配范围，
+        // 而不是继续用无差别的 --activate-match "Google Chrome"
+        let target = IconClickTarget {
+            hwnd: 197304,
+            region: (100, 50, 300, 80),
+        };
+        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", Some(&target));
+        assert!(cmd.contains("--hwnd 197304"), "有明确目标时必须精确指定 HWND，不能再靠标题匹配猜");
+        assert!(
+            cmd.contains("--region 100,50,300,80"),
+            "必须把匹配范围收窄到目标窗口，不能继续全屏扫描"
+        );
+        assert!(cmd.contains("--activate"), "仍需要先激活确保窗口可见可点");
+        assert!(cmd.contains("--click"), "仍需要直接点击");
+        assert!(
+            !cmd.contains("--activate-match"),
+            "有精确 HWND 时不应再传标题匹配参数，避免脚本里两套定位逻辑混用产生歧义"
+        );
     }
 
     #[test]
@@ -4367,6 +4730,49 @@ mod tests {
             parse_window_handle_for_pid_output("0"),
             None,
             "句柄为 0 代表没有主窗口，不是合法句柄"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // HWND -> 窗口矩形（DEV-125986 第6步）：拿到目标窗口句柄后，查询
+    // 它在屏幕上的矩形，传给图标定位脚本做区域限定。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_window_rect_script_uses_get_window_rect() {
+        let script = build_window_rect_script(197304);
+        assert!(script.contains("197304"), "必须把目标 HWND 拼进脚本");
+        assert!(
+            script.contains("GetWindowRect"),
+            "必须调用 GetWindowRect 才能拿到虚拟桌面绝对坐标，\
+             这跟脚本 --region 参数的坐标系是同一套"
+        );
+    }
+
+    #[test]
+    fn test_parse_window_rect_output_valid() {
+        // 输出契约：一行 "left,top,right,bottom"（GetWindowRect 原生
+        // 返回的是右下角坐标，不是宽高，需要在这里转换成 --region 要的
+        // left,top,width,height 格式）
+        assert_eq!(
+            parse_window_rect_output("100,50,400,130"),
+            Some((100, 50, 300, 80)),
+            "应把 GetWindowRect 的 (left,top,right,bottom) 转成 \
+             (left,top,width,height)"
+        );
+    }
+
+    #[test]
+    fn test_parse_window_rect_output_invalid_returns_none() {
+        assert_eq!(
+            parse_window_rect_output(""),
+            None,
+            "查询失败（如窗口已关闭）时应返回 None，不能 panic 或返回一个 (0,0,0,0) 的假区域"
+        );
+        assert_eq!(
+            parse_window_rect_output("100,50,400"),
+            None,
+            "字段数不对时应返回 None，不能拼凑残缺数据"
         );
     }
 }
