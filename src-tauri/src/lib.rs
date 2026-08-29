@@ -3860,6 +3860,27 @@ mod tests {
     }
 
     #[test]
+    fn test_icon_locator_script_supports_region_argument() {
+        // DEV-125986 第5步：多实例场景下，客户端已经能定位到目标 HWND 的
+        // 屏幕矩形，脚本必须支持「只在这个矩形内找图标」而不是永远全屏
+        // 扫描——否则前面几步的精确定位全部白做，点击时依然可能撞上别的
+        // 实例的同款图标。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/icon-locator");
+        let script = dir.join("aichat_icon_locator.py");
+        let src = fs::read_to_string(&script).expect("读取脚本");
+        assert!(
+            src.contains("--region"),
+            "脚本必须新增 --region 参数（left,top,width,height），\
+             用于把模板匹配范围收窄到目标窗口内，不再无差别扫全屏"
+        );
+        assert!(
+            src.contains("not args.region") || src.contains("args.region is None") || src.contains("if args.region:"),
+            "不传 --region 时必须保持原有全屏扫描行为（向后兼容），\
+             不能让这个新参数变成强制项"
+        );
+    }
+
+    #[test]
     fn test_parse_icon_click_result_success() {
         // 脚本契约：stdout 一行 x,y（物理像素绝对坐标），退出码 0
         let r = parse_icon_click_result("1678,62", 0, "");

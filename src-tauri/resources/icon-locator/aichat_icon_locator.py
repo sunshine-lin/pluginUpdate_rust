@@ -2,27 +2,44 @@
 """
 识别 Chrome 工具栏上「AIChat 扩展图标」的屏幕坐标。
 
-原始版本由领导提供（用于 ChatGPT 图标 + ShadowBot 场景），此处除以下两处外
+原始版本由领导提供（用于 ChatGPT 图标 + ShadowBot 场景），此处除以下几处外
 **未改动任何逻辑**：
   1. 默认模板换成 aichat_template.png（原来是 ChatGPT 的花瓣 logo，
      拿它去找我们的蓝色文档+放大镜图标必然 NOT_FOUND）
   2. 文件更名，避免下一个人被 chatgpt 这个名字误导
+  3. DEV-125986：新增 --region/--hwnd，支持把匹配范围收窄到指定窗口，
+     不再永远全屏扫描（见下方「多实例定位」说明）
 
-⚠️ 已知限制（多实例场景，接入时未改）：脚本在整个虚拟桌面上取匹配分数
-最高的**一个**图标。一台采购机开着 8~10 个 Chrome 窗口、每个都有同样的
-图标时，返回的是「最像模板的那个」而非「你要的那个」。
-方法：整屏截图 + OpenCV 多尺度模板匹配 —— 对分辨率 / DPI 缩放 / 窗口位置免疫。
+多实例定位（DEV-125986，2026-08-28 真机验证方案落地）：
+原方案在整个虚拟桌面上取匹配分数最高的**一个**图标，一台采购机开着
+8~10 个 Chrome 窗口、每个都有同样的图标时，返回的是「最像模板的那个」
+而非「你要的那个」。客户端侧现在已经能通过 UI Automation（单进程多
+Profile 架构）或映射表+进程枚举（独立进程架构）精确定位到目标窗口的
+HWND，本脚本新增 --region 参数接收该窗口的屏幕矩形（客户端侧
+GetWindowRect 得到），把截图和模板匹配范围都收窄到这个矩形内——
+不传 --region 时保持原有全屏扫描行为（向后兼容，未接入新定位方案的
+调用方不受影响）。
+
+--hwnd 是配套的精确激活参数：--activate-match 按标题子串匹配、多个
+同标题窗口时无法区分该抬哪一个（原有的"标题最长"启发式对多实例场景
+基本无效）；传入 --hwnd 后直接激活这一个已知句柄，不再依赖标题匹配。
+两者互斥：给了 --hwnd 就忽略 --activate-match。
+
+方法：整屏（或 --region 限定的区域）截图 + OpenCV 多尺度模板匹配 ——
+对分辨率 / DPI 缩放 / 窗口位置免疫。
 给 ShadowBot 用：默认在标准输出打印一行 `x,y`（物理像素、绝对屏幕坐标），
 找不到则退出码=2，出错退出码=1。
 
 依赖：opencv-python(cv2)、numpy、Pillow —— 本机 Python 3.10 均已自带，无需安装。
 
 用法示例：
-  python aichat_icon_locator.py                 # 打印 "1678,62"
+  python aichat_icon_locator.py                 # 打印 "1678,62"（全屏扫描，旧行为）
   python aichat_icon_locator.py --json          # 打印 JSON(含置信度/尺度)
   python aichat_icon_locator.py --click         # 直接移动鼠标并左键点击
-  python aichat_icon_locator.py --save-debug d:\tmp\hit.png   # 存一张带命中框的图核对
+  python aichat_icon_locator.py --save-debug d:\\tmp\\hit.png   # 存一张带命中框的图核对
   python aichat_icon_locator.py --threshold 0.55 --template 别的图标.png
+  python aichat_icon_locator.py --hwnd 197304 --activate --region 100,50,300,80 --click
+      # 多实例场景：精确激活+限定区域匹配+点击目标实例的图标
 """
 import argparse
 import ctypes
@@ -37,7 +54,6 @@ from PIL import ImageGrab
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TEMPLATE = os.path.join(HERE, "aichat_template.png")
-
 
 
 def imread_unicode(path, flags=cv2.IMREAD_COLOR):
@@ -86,8 +102,34 @@ def virtual_origin():
     return u.GetSystemMetrics(SM_XVIRTUALSCREEN), u.GetSystemMetrics(SM_YVIRTUALSCREEN)
 
 
-def grab_screen_bgr():
-    img = ImageGrab.grab(all_screens=True)  # 整个虚拟桌面
+def parse_region(s):
+    """解析 --region 参数值："left,top,width,height"（虚拟桌面绝对坐标，
+    与 GetWindowRect 同一坐标系）。格式错误时抛 ValueError，由调用方
+    统一处理成参数错误退出，而不是让 argparse 之外的地方悄悄吞掉。"""
+    parts = s.split(",")
+    if len(parts) != 4:
+        raise ValueError("region 必须是 left,top,width,height 四个数字")
+    left, top, width, height = (int(p.strip()) for p in parts)
+    if width <= 0 or height <= 0:
+        raise ValueError("region 的 width/height 必须为正数")
+    return left, top, width, height
+
+
+def grab_screen_bgr(region=None):
+    """截图。region 为 (left, top, width, height)，是虚拟桌面绝对坐标
+    （与 GetWindowRect 同一坐标系）；不传则截整个虚拟桌面（原有行为）。
+
+    PIL 的 bbox 参数用的是"相对主屏幕左上角"的坐标系，而客户端传来的
+    region 是虚拟桌面绝对坐标——多屏且副屏在左/上时两者有偏移，必须先
+    减去 virtual_origin() 才能对齐，否则副屏上的窗口会截到错误位置。
+    """
+    if region is None:
+        img = ImageGrab.grab(all_screens=True)
+    else:
+        left, top, width, height = region
+        vx, vy = virtual_origin()
+        bbox = (left - vx, top - vy, left - vx + width, top - vy + height)
+        img = ImageGrab.grab(bbox=bbox, all_screens=True)
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
@@ -115,18 +157,16 @@ def _enum_windows():
     return out
 
 
-def activate_window(match="Google Chrome", wait_ms=500):
-    """把标题含 match 的窗口抬到最前（越过前台锁）。找到返回 True。"""
-    u = ctypes.windll.user32
+def _prep_window_api(u):
     for f in ("IsIconic", "ShowWindow", "SwitchToThisWindow",
               "BringWindowToTop", "SetForegroundWindow"):
         getattr(u, f).argtypes = [ctypes.c_void_p] + \
             ([ctypes.c_int] if f == "ShowWindow" else
              [ctypes.c_bool] if f == "SwitchToThisWindow" else [])
-    wins = [(h, t) for (h, t) in _enum_windows() if match in t]
-    if not wins:
-        return False
-    hwnd = max(wins, key=lambda x: len(x[1]))[0]  # 主窗口取标题最长的
+
+
+def _activate_hwnd(u, hwnd, wait_ms):
+    """把指定句柄的窗口抬到最前（越过前台锁）。"""
     if u.IsIconic(hwnd):
         u.ShowWindow(hwnd, 9)  # SW_RESTORE
     # 轻敲 ALT 解除前台锁，再抬窗
@@ -140,6 +180,32 @@ def activate_window(match="Google Chrome", wait_ms=500):
     u.BringWindowToTop(hwnd)
     u.SetForegroundWindow(hwnd)
     time.sleep(max(0, wait_ms) / 1000.0)
+
+
+def activate_window_by_hwnd(hwnd, wait_ms=500):
+    """精确激活指定 HWND（DEV-125986：客户端已知道目标窗口句柄时用这个，
+    不再依赖标题匹配——多实例场景下标题都类似，匹配不出「哪一个」）。"""
+    u = ctypes.windll.user32
+    _prep_window_api(u)
+    _activate_hwnd(u, hwnd, wait_ms)
+
+
+def activate_window(match="Google Chrome", wait_ms=500):
+    """把标题含 match 的窗口抬到最前（越过前台锁）。找到返回 True。
+
+    ⚠️ 已知局限（多实例场景，未改）：多个窗口标题都含 match 时，取
+    「标题最长」的那一个——这是单实例场景下的启发式，对多实例场景基本
+    无效（哪个网页标题字数多纯属巧合，与目标实例无关）。多实例场景应
+    优先用 activate_window_by_hwnd，本函数保留仅供单实例场景 /
+    未传 --hwnd 时的向后兼容。
+    """
+    u = ctypes.windll.user32
+    _prep_window_api(u)
+    wins = [(h, t) for (h, t) in _enum_windows() if match in t]
+    if not wins:
+        return False
+    hwnd = max(wins, key=lambda x: len(x[1]))[0]  # 主窗口取标题最长的
+    _activate_hwnd(u, hwnd, wait_ms)
     return True
 
 
@@ -170,7 +236,7 @@ def click(x, y):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="定位 Chrome 工具栏 ChatGPT 扩展图标")
+    ap = argparse.ArgumentParser(description="定位 Chrome 工具栏 AIChat 扩展图标")
     ap.add_argument("--template", default=DEFAULT_TEMPLATE, help="图标模板 PNG")
     ap.add_argument("--threshold", type=float, default=0.55, help="匹配阈值(0~1)，低于则判为未找到")
     ap.add_argument("--min-scale", type=float, default=0.5)
@@ -179,26 +245,42 @@ def main():
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--click", action="store_true", help="找到后直接点击")
     ap.add_argument("--activate", action="store_true", help="先把 Chrome 窗口激活到最前再识别")
-    ap.add_argument("--activate-match", default="Google Chrome", help="要激活的窗口标题包含串")
+    ap.add_argument("--activate-match", default="Google Chrome", help="要激活的窗口标题包含串（未传 --hwnd 时生效）")
     ap.add_argument("--activate-wait", type=int, default=500, help="激活后等待毫秒(默认500)")
     ap.add_argument("--save-debug", metavar="PATH", help="保存带命中框的截图以核对")
+    ap.add_argument("--region", metavar="LEFT,TOP,W,H",
+                     help="把截图与匹配范围收窄到这个矩形（虚拟桌面绝对坐标，与 GetWindowRect 同坐标系）。"
+                          "不传则全屏扫描（DEV-125986 之前的行为，向后兼容）")
+    ap.add_argument("--hwnd", type=int,
+                     help="要激活的窗口句柄（精确指定，优先于 --activate-match）。"
+                          "多实例场景下客户端已知道目标 HWND 时应传这个，而不是靠标题匹配")
     args = ap.parse_args()
 
     if not os.path.isfile(args.template):
         print("ERROR: template not found: %s" % args.template, file=sys.stderr)
         return 1
 
+    region = None
+    if args.region:
+        try:
+            region = parse_region(args.region)
+        except ValueError as e:
+            print("ERROR: invalid --region: %s" % e, file=sys.stderr)
+            return 1
+
     make_dpi_aware()
 
     if args.activate:
-        if not activate_window(args.activate_match, args.activate_wait):
+        if args.hwnd:
+            activate_window_by_hwnd(args.hwnd, args.activate_wait)
+        elif not activate_window(args.activate_match, args.activate_wait):
             print("ERROR: no window titled *%s* to activate" % args.activate_match,
                   file=sys.stderr)
             return 1
 
     vx, vy = virtual_origin()
 
-    frame = grab_screen_bgr()
+    frame = grab_screen_bgr(region)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     tpl = imread_unicode(args.template, cv2.IMREAD_GRAYSCALE)
     if tpl is None:
@@ -211,8 +293,15 @@ def main():
         return 2
 
     val, left, top, w, h, scale = best
-    cx = vx + left + w // 2
-    cy = vy + top + h // 2
+    # region 截图的 (0,0) 对应 region 矩形左上角在绝对坐标系里的位置，
+    # 需要把 region 的偏移加回去才是真正的绝对坐标；不传 region 时
+    # frame 本身就是整个虚拟桌面截图，偏移就是 virtual_origin()
+    if region is not None:
+        base_x, base_y = region[0], region[1]
+    else:
+        base_x, base_y = vx, vy
+    cx = base_x + left + w // 2
+    cy = base_y + top + h // 2
 
     if args.save_debug:
         dbg = frame.copy()
