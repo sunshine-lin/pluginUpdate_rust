@@ -1257,6 +1257,16 @@ pub fn parse_icon_click_result(
             "脚本执行出错（模板文件缺失，或找不到 Chrome 窗口）: {}",
             stderr.trim()
         )),
+        // Windows 标准错误码：cmd 找不到要执行的命令。这里几乎总是因为
+        // 目标机器没装 Python、或装了但没加入系统 PATH（2026-08-29 真机
+        // 实测踩过）——直接点出根因，而不是让非技术的采购同事去查一个
+        // 陌生的数字含义
+        9009 => Err(
+            "未找到 python 命令。该机器可能未安装 Python，或安装时未勾选\
+             「Add python.exe to PATH」。请安装 Python 3.8 及以上版本\
+             （勾选加入 PATH）并安装依赖（opencv-python、numpy、Pillow）后重试"
+                .to_string(),
+        ),
         c => Err(format!("脚本返回未知退出码 {}: {}", c, stderr.trim())),
     }
 }
@@ -1895,8 +1905,11 @@ fn locate_icon_click_target_os(_plugin_name: &str) -> Option<IconClickTarget> {
 
 /// 执行图标定位脚本，返回 (stdout, stderr, 退出码)。
 ///
-/// Windows 用 `python`（目标机器的 Python 3.10 自带 cv2/numpy/Pillow，
-/// 见脚本 README）。**不能加 CREATE_NO_WINDOW**——脚本本身就要抢前台
+/// Windows 用 `python`（目标机器需装 Python 3.8+ 并配好 PATH，
+/// 且装有 cv2/numpy/Pillow 三个依赖库——不是版本硬性要求，见脚本
+/// 头部说明；2026-08-29 实测某测试机因未装 Python 触发 9009
+/// "命令未找到"错误，属部署前置条件缺失，非脚本逻辑问题）。
+/// **不能加 CREATE_NO_WINDOW**——脚本本身就要抢前台
 /// 才能截到图，隐藏控制台窗口不改变这一点，反而让人看不到它在跑。
 #[cfg(target_os = "windows")]
 fn run_icon_locator_os(
@@ -1911,7 +1924,7 @@ fn run_icon_locator_os(
         .args(["/C", &format!("python {}", args)])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|e| format!("启动 python 失败（目标机器是否装了 Python 3.10？）: {}", e))?;
+        .map_err(|e| format!("启动 python 失败（目标机器是否装了 Python 且已加入 PATH？）: {}", e))?;
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -4273,6 +4286,25 @@ mod tests {
         // 应该报错，而不是静默返回 (0,0) 去点屏幕左上角
         let r = parse_icon_click_result("hello world", 0, "");
         assert!(r.is_err(), "无法解析成坐标时宁可失败，也不能乱点");
+    }
+
+    #[test]
+    fn test_parse_icon_click_result_command_not_found() {
+        // 2026-08-29 真机实测踩过：目标机器未装 Python/未加入 PATH 时，
+        // cmd 内部执行 "python <脚本>" 会返回 Windows 标准错误码 9009
+        // （"不是内部或外部命令"）。原文案只把这个数字甩给用户，非技术
+        // 采购同事完全看不懂——必须点出最常见的根因，而不是让人去查
+        // Windows 错误码含义
+        let r = parse_icon_click_result("", 9009, "");
+        assert!(r.is_err());
+        if let Err(e) = r {
+            assert!(
+                e.contains("Python") && (e.contains("安装") || e.contains("PATH")),
+                "9009 是 Windows 标准的「命令未找到」错误码，报错必须直接点出\
+                 最常见根因（未装 Python / 未加入 PATH），而不是只报一个数字。实际报错: {}",
+                e
+            );
+        }
     }
 
     #[test]

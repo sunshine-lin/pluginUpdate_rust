@@ -30,7 +30,10 @@ GetWindowRect 得到），把截图和模板匹配范围都收窄到这个矩形
 给 ShadowBot 用：默认在标准输出打印一行 `x,y`（物理像素、绝对屏幕坐标），
 找不到则退出码=2，出错退出码=1。
 
-依赖：opencv-python(cv2)、numpy、Pillow —— 本机 Python 3.10 均已自带，无需安装。
+依赖：opencv-python(cv2)、numpy、Pillow。不是 Python 版本硬性要求（脚本
+只用了各版本长期稳定支持的常规语法/API），3.8 及以上均可；"3.10"最初只是
+照抄领导原始环境的版本号，10 号机实测装 3.12 同样能正常运行。目标机器若
+没装这三个库，需要 `pip install opencv-python numpy Pillow`。
 
 用法示例：
   python aichat_icon_locator.py                 # 打印 "1678,62"（全屏扫描，旧行为）
