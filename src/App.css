@@ -1275,13 +1275,6 @@
   }
 }
 
-/* 「点插件图标」按钮（DEV-125034）：放在巡检页顶部摘要行，与表格里每行的
-   四个指令按钮区分开——那些是发指令给单个实例、互不影响，这个是整机级
-   且会抢焦点。用 danger 配色 + 左侧留白，视觉上明确它不是同一类操作 */
-.patrol-icon-btn {
-  margin-left: auto;
-}
-
 /* 自动更新已关的常驻提示（2026-08-27）。
    用琥珀色而非红色：这是用户主动关的、属于「需要知道」而非「出错了」，
    刺眼的红会让人以为客户端坏了 */
@@ -1376,6 +1369,29 @@
 }
 
 .chrome-mapping-save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* "刷新候选"是次级操作（人工触发拉取，见 DEV-125986 用按钮取代
+   useEffect 自动加载的说明），跟"保存映射"这个主操作用不同视觉权重
+   区分，避免两个蓝色按钮抢注意力 */
+.chrome-mapping-refresh-btn {
+  padding: 6px 16px;
+  background: #fff;
+  color: #1a73e8;
+  border: 1px solid #1a73e8;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.chrome-mapping-refresh-btn:hover:not(:disabled) {
+  background: #f0f6ff;
+}
+
+.chrome-mapping-refresh-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
