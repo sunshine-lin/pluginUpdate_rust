@@ -1900,6 +1900,35 @@ pub fn find_pid_for_user_data_dir_name(processes: &[(u32, String)], dir_name: &s
         .map(|(pid, _)| *pid)
 }
 
+/// 构建查询指定 PID 主窗口句柄的 PowerShell 脚本。
+///
+/// 独立进程架构下拿到目标 chrome.exe 的 PID 后，最后一步是找到它的
+/// 可见主窗口——`Get-Process -Id` 本身就带 `MainWindowHandle` 属性，
+/// 不需要额外的 `GetWindowThreadProcessId` Win32 调用。
+pub fn build_window_handle_for_pid_script(pid: u32) -> String {
+    format!(
+        "(Get-Process -Id {} -ErrorAction SilentlyContinue).MainWindowHandle",
+        pid
+    )
+}
+
+/// 解析 [`build_window_handle_for_pid_script`] 的输出。
+///
+/// 空输出（进程不存在/已退出）或句柄为 0（存在但没有可见主窗口，
+/// Win32 惯例）都返回 `None`——两种情况对调用方而言都是「找不到可点击
+/// 的窗口」，不需要区分。
+pub fn parse_window_handle_for_pid_output(output: &str) -> Option<u64> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(hwnd) => Some(hwnd),
+        Err(_) => None,
+    }
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -4268,6 +4297,55 @@ mod tests {
             None,
             "映射表指向的目录名如果当前没有对应的运行中进程（比如该实例\
              Chrome 还没启动），应返回 None 而不是误配"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PID -> HWND（DEV-125986 第4步 part 2）：拿到目标 chrome.exe 主
+    // 进程 PID 后，找到它对应的可见主窗口句柄。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_window_handle_for_pid_script_filters_by_id() {
+        let script = build_window_handle_for_pid_script(7292);
+        assert!(
+            script.contains("7292"),
+            "必须把目标 PID 拼进脚本，否则查的是全部 chrome.exe"
+        );
+        assert!(
+            script.contains("MainWindowHandle"),
+            "要拿到的正是这个进程的主窗口句柄"
+        );
+    }
+
+    #[test]
+    fn test_parse_window_handle_for_pid_output_valid() {
+        assert_eq!(
+            parse_window_handle_for_pid_output("197304"),
+            Some(197304u64),
+            "输出是单行句柄数字时应正确解析"
+        );
+    }
+
+    #[test]
+    fn test_parse_window_handle_for_pid_output_no_visible_window() {
+        // 该 PID 存在但没有可见主窗口（如后台常驻、窗口已关闭）时，
+        // PowerShell 侧 Get-Process 会返回空字符串
+        assert_eq!(
+            parse_window_handle_for_pid_output(""),
+            None,
+            "空输出（进程无可见主窗口）应返回 None，不能 panic"
+        );
+    }
+
+    #[test]
+    fn test_parse_window_handle_for_pid_output_zero_handle() {
+        // MainWindowHandle 为 0 同样代表「没有主窗口」（Win32 惯例），
+        // 不能当成一个合法句柄返回
+        assert_eq!(
+            parse_window_handle_for_pid_output("0"),
+            None,
+            "句柄为 0 代表没有主窗口，不是合法句柄"
         );
     }
 }
