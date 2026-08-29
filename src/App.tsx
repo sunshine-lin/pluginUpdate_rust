@@ -542,21 +542,23 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
-  /// Chrome Profile 映射表确认页（DEV-125986）：进入页面时加载一次候选数据。
+  /// 加载 Chrome Profile 映射表确认页的候选数据（DEV-125986）。
   ///
-  /// 不轮询——这是人工一次性确认的操作，不像巡检看板那样需要看实时变化。
-  /// 每次进入页面重新拉取（而不是缓存），是因为候选（在线 plugin_name/
-  /// 当前 chrome.exe 进程）可能随时变化，进页面时应该看到当下最新状态。
-  useEffect(() => {
-    if (view !== "chrome-mapping") return;
-    setMappingHint("");
+  /// 改成人工点按钮触发，而非进入页面/切 tab 自动拉取：早期版本用
+  /// `useEffect([view])` 自动加载，副作用是——用户选了几行还没点保存，
+  /// 切到别的 tab 再切回来，`useEffect` 会重新拉取并用 `savedMapping`
+  /// 覆盖掉正在编辑但未保存的 `mappingDraft`，选择白做。改成手动触发后，
+  /// 只有用户主动点"刷新候选"才会重新拉取，不会有任何意外覆盖。
+  function loadChromeProfileCandidates() {
+    setMappingHint("正在检测 Chrome 进程与在线实例…");
     invoke<ChromeProfileCandidates>("get_chrome_profile_candidates")
       .then((c) => {
         setChromeCandidates(c);
         setMappingDraft(c.savedMapping);
+        setMappingHint("");
       })
       .catch((e) => setMappingHint(`读取候选数据失败: ${e}`));
-  }, [view]);
+  }
 
   /// 保存人工在映射表确认界面里选定的对应关系。
   ///
@@ -580,7 +582,8 @@ function App() {
     }
   }
 
-  /// 点 Chrome 工具栏上的插件图标（领导给的方案，走图像识别 + 模拟鼠标）。
+  /// 点 Chrome 工具栏上的插件图标，打开指定实例的侧边栏
+  /// （领导给的方案，走图像识别 + 模拟鼠标；DEV-125986 起按实例精确定位）。
   ///
   /// # 为什么要二次确认
   /// 它和那四个指令按钮性质完全不同：那些是通过心跳通道发给某个实例、
@@ -590,11 +593,11 @@ function App() {
   /// 所以点之前要让人确认「现在这台机器可以被打断」。
   ///
   /// # 精确定位（DEV-125986）
-  /// 传入 `pluginName` 时，后端会按该实例定位到具体窗口做区域限定点击，
-  /// 不再无差别全屏找图标——巡检表格里"侧边栏未打开"那一行的按钮应传
-  /// 这个参数。不传（顶部兜底按钮）时后端在两条定位路径都失败时也会
-  /// 走这个全屏兜底逻辑，用于映射表未配置/UI Automation 用不了的场景。
-  async function clickPluginIcon(pluginName?: string) {
+  /// 后端按 `pluginName` 定位到具体窗口做区域限定点击，不再无差别全屏
+  /// 找图标——两条定位路径（映射表/UI Automation）都失败时，后端仍会
+  /// 自动回退到全屏扫描兜底，前端不需要额外的"全屏兜底"入口（原顶部
+  /// 常驻按钮已移除，见 DEV-125986：表格行内按钮已覆盖唯一有效场景）。
+  async function clickPluginIcon(pluginName: string) {
     const ok = window.confirm(
       "点插件图标会做两件有副作用的事：\n\n" +
         "1. 把 Chrome 窗口抢到最前（夺走焦点）\n" +
@@ -603,15 +606,10 @@ function App() {
         "按键可能落到别处。确认现在可以打断吗？",
     );
     if (!ok) return;
-    const key = pluginName ? `icon:${pluginName}` : "icon";
-    setSendingCmd(key);
-    setPatrolHint(
-      pluginName
-        ? `正在识别并点击 ${pluginName} 的插件图标…（约需 1~2 秒）`
-        : "正在识别并点击插件图标…（约需 1~2 秒）",
-    );
+    setSendingCmd(`icon:${pluginName}`);
+    setPatrolHint(`正在识别并点击 ${pluginName} 的插件图标…（约需 1~2 秒）`);
     try {
-      const msg = await invoke<string>("click_plugin_icon", { pluginName: pluginName ?? null });
+      const msg = await invoke<string>("click_plugin_icon", { pluginName });
       setPatrolHint(msg);
     } catch (e) {
       // 失败原因对排查有用（没找到图标 = 可能要重截模板；没装 Python 等），
@@ -1074,20 +1072,6 @@ function App() {
                 `（${patrol?.minimizedWindows} 个已最小化）`}
             </span>
             {patrolHint && <span className="patrol-hint">{patrolHint}</span>}
-            {/*
-              点插件图标兜底按钮（DEV-125034/DEV-125986）。放在页面顶部，
-              不带 pluginName——用于映射表未配置、或 UI Automation 用不了
-              的机器上，走原有全屏扫描逻辑。多数场景应优先用表格行内那个
-              "打开侧边栏"按钮（精确定位到具体实例，见 DEV-125986）。
-            */}
-            <button
-              className="patrol-btn patrol-btn-danger patrol-icon-btn"
-              disabled={sendingCmd !== null}
-              onClick={() => clickPluginIcon()}
-              title="用图像识别在整个屏幕上找插件图标并模拟鼠标点击（全屏兜底，不区分具体是哪个实例）。⚠️ 会把 Chrome 窗口抢到最前并移动鼠标，可能打断其它实例正在进行的聊天输入"
-            >
-              点插件图标（全屏兜底）
-            </button>
           </div>
           <div className="log-table-wrap">
             {!patrol || patrol.instances.length === 0 ? (
@@ -1290,9 +1274,22 @@ function App() {
             仅「每个插件实例各自用独立 Chrome 快捷方式（各自 --user-data-dir）启动」的机器需要配置。
             为每个检测到的 Chrome 数据目录选择对应的插件实例，保存后「打开侧边栏」按钮才能精确点击到这个实例。
           </p>
+          {/*
+            "刷新候选"按钮：改为人工触发而非进入页面/切 tab 自动拉取。
+            早期版本用 useEffect([view]) 自动加载，副作用是切 tab 来回
+            会用 savedMapping 覆盖掉正在编辑但未保存的选择——选了半天，
+            切一下 tab 就白选。改成按钮后不会有任何意外时机的重新拉取。
+          */}
+          <button
+            className="chrome-mapping-refresh-btn"
+            onClick={loadChromeProfileCandidates}
+            disabled={mappingSaving}
+          >
+            {chromeCandidates ? "刷新候选" : "检测 Chrome 进程与在线实例"}
+          </button>
           {mappingHint && <p className="chrome-mapping-hint">{mappingHint}</p>}
           {!chromeCandidates ? (
-            <p className="chrome-mapping-loading">正在检测 Chrome 进程与在线实例…</p>
+            <p className="chrome-mapping-loading">点上面的按钮开始检测</p>
           ) : chromeCandidates.directoryNames.length === 0 ? (
             <p className="chrome-mapping-empty">
               未检测到独立启动的 Chrome 进程（本机可能是单进程多 Profile 架构，不需要在这里配置）
