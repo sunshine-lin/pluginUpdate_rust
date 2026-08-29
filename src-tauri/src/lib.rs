@@ -1193,17 +1193,34 @@ pub fn build_firewall_rule_script_windows(port: u16) -> String {
 /// 替代全屏扫描）。`target` 为 `None` 时保持原有全屏 + 标题匹配行为，
 /// 用于识别路径两条都没能定位到目标窗口时的兜底（宁可按旧逻辑赌一次，
 /// 也不是直接放弃不点）。
-pub fn build_icon_click_command(script_path: &str, target: Option<&IconClickTarget>) -> String {
+///
+/// # 为什么返回参数数组而不是拼一整条字符串（2026-08-29 真机 bug 修复）
+/// 旧实现拼一整条字符串交给 `cmd /C "python <整条字符串>"` 执行。真机实测
+/// 暴露的问题：Tauri `path().resolve()` 在某些场景下返回的脚本路径带
+/// `\\?\` 长路径前缀，混进这条字符串后被 `cmd` 的引号/转义规则打乱，
+/// 实际执行时报 `can't open file`，路径被拼成相对于
+/// `C:\Windows\system32` 的畸形结果——报错还被上层误判成「找不到图标」，
+/// 完全文不对题。返回参数数组交给 `Command::args()` 直接执行，每个参数
+/// 各自独立传递，不经过任何 shell 字符串解析，从根上避免这整类问题。
+pub fn build_icon_click_command(script_path: &str, target: Option<&IconClickTarget>) -> Vec<String> {
+    let mut args = vec![script_path.to_string(), "--activate".to_string()];
     match target {
-        Some(t) => format!(
-            "\"{}\" --activate --hwnd {} --region {},{},{},{} --click",
-            script_path, t.hwnd, t.region.0, t.region.1, t.region.2, t.region.3
-        ),
-        None => format!(
-            "\"{}\" --activate --activate-match \"Google Chrome\" --click",
-            script_path
-        ),
+        Some(t) => {
+            args.push("--hwnd".to_string());
+            args.push(t.hwnd.to_string());
+            args.push("--region".to_string());
+            args.push(format!(
+                "{},{},{},{}",
+                t.region.0, t.region.1, t.region.2, t.region.3
+            ));
+        }
+        None => {
+            args.push("--activate-match".to_string());
+            args.push("Google Chrome".to_string());
+        }
     }
+    args.push("--click".to_string());
+    args
 }
 
 /// 精确点击目标：已定位到的窗口句柄 + 该窗口在屏幕上的矩形（虚拟桌面
@@ -1919,9 +1936,12 @@ fn run_icon_locator_os(
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let args = build_icon_click_command(script, target);
-    // 走 cmd 是为了让 `python` 走 PATH 解析（目标机器装在 Program Files 下）
-    let output = std::process::Command::new("cmd")
-        .args(["/C", &format!("python {}", args)])
+    // 直接执行 `python`（走 PATH 解析），参数各自独立传递，不经过 cmd 的
+    // 字符串拼接/转义——2026-08-29 真机实测过旧的 `cmd /C "python <一整条
+    // 字符串>"` 写法在脚本路径带 `\\?\` 长路径前缀时会被引号规则打乱，
+    // 见 build_icon_click_command 文档
+    let output = std::process::Command::new("python")
+        .args(&args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("启动 python 失败（目标机器是否装了 Python 且已加入 PATH？）: {}", e))?;
@@ -4180,14 +4200,23 @@ mod tests {
 
     #[test]
     fn test_build_icon_click_command_include_activate_and_click() {
-        // 理想的一条命令（README 里写的）：激活 Chrome + 找到图标 + 直接点。
-        // 不传 python 路径（用 PATH），只传脚本参数；脚本路径由调用方注入
-        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", None);
-        // 在 Windows 上实际是 "python <script> --activate --click"，
-        // 这里只测脚本参数部分（Windows 分支会拼 python 前缀）
-        assert!(cmd.contains("--activate"), "必须先激活 Chrome——图标可能被其它窗口遮挡");
-        assert!(cmd.contains("--click"), "找到后要直接点，别把坐标传回来再转一手");
-        assert!(cmd.contains("--activate-match"), "要指定挑哪个 Chrome 窗口");
+        // 理想的一组参数（README 里写的）：激活 Chrome + 找到图标 + 直接点。
+        // 2026-08-29 真机实测暴露的 bug：旧实现返回一整条字符串交给
+        // `cmd /C "python <script> ..."` 拼接执行，脚本路径若含
+        // Tauri 在某些场景下返回的 `\\?\` 长路径前缀，会被 cmd 的引号/
+        // 转义规则打乱，实际执行时报 "can't open file" 且路径被拼成
+        // 相对于 C:\Windows\system32 的畸形路径。
+        // 改为返回参数数组（Vec<String>），交给 `Command::new("python").args(..)`
+        // 直接执行——不经过任何 shell 字符串解析，从根上避免这类转义问题。
+        let args = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", None);
+        assert_eq!(
+            args[0], "/opt/icon-locator/aichat_icon_locator.py",
+            "脚本路径必须是独立的一个参数，不能和其它参数拼在同一个字符串里"
+        );
+        assert!(args.contains(&"--activate".to_string()), "必须先激活 Chrome——图标可能被其它窗口遮挡");
+        assert!(args.contains(&"--click".to_string()), "找到后要直接点，别把坐标传回来再转一手");
+        assert!(args.contains(&"--activate-match".to_string()), "要指定挑哪个 Chrome 窗口");
+        assert!(args.contains(&"Google Chrome".to_string()), "标题匹配串本身也要是独立参数，不能被外层引号吞掉空格");
     }
 
     #[test]
@@ -4199,16 +4228,17 @@ mod tests {
             hwnd: 197304,
             region: (100, 50, 300, 80),
         };
-        let cmd = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", Some(&target));
-        assert!(cmd.contains("--hwnd 197304"), "有明确目标时必须精确指定 HWND，不能再靠标题匹配猜");
+        let args = build_icon_click_command("/opt/icon-locator/aichat_icon_locator.py", Some(&target));
+        assert!(args.contains(&"--hwnd".to_string()), "有明确目标时必须精确指定 HWND，不能再靠标题匹配猜");
+        assert!(args.contains(&"197304".to_string()));
         assert!(
-            cmd.contains("--region 100,50,300,80"),
+            args.contains(&"--region".to_string()) && args.contains(&"100,50,300,80".to_string()),
             "必须把匹配范围收窄到目标窗口，不能继续全屏扫描"
         );
-        assert!(cmd.contains("--activate"), "仍需要先激活确保窗口可见可点");
-        assert!(cmd.contains("--click"), "仍需要直接点击");
+        assert!(args.contains(&"--activate".to_string()), "仍需要先激活确保窗口可见可点");
+        assert!(args.contains(&"--click".to_string()), "仍需要直接点击");
         assert!(
-            !cmd.contains("--activate-match"),
+            !args.contains(&"--activate-match".to_string()),
             "有精确 HWND 时不应再传标题匹配参数，避免脚本里两套定位逻辑混用产生歧义"
         );
     }
