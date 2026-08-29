@@ -1296,3 +1296,102 @@
     color: #e0b050;
   }
 }
+
+/* Chrome Profile 映射表确认页（DEV-125986）。独立进程架构专用——
+   复用巡检表格的视觉语言，保持整站风格一致 */
+.chrome-mapping-view {
+  padding: 16px 0;
+}
+
+.chrome-mapping-intro {
+  color: #666;
+  font-size: 13px;
+  margin-bottom: 12px;
+  line-height: 1.6;
+}
+
+.chrome-mapping-hint {
+  color: #1a73e8;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.chrome-mapping-loading,
+.chrome-mapping-empty {
+  color: #999;
+  font-size: 13px;
+}
+
+.chrome-mapping-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.chrome-mapping-table thead th {
+  background: #f5f5f7;
+  color: #666;
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.chrome-mapping-table tbody tr:nth-child(even) {
+  background: #f8f9fb;
+}
+
+.chrome-mapping-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #eee;
+}
+
+.chrome-mapping-dir {
+  font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chrome-mapping-save-btn {
+  padding: 8px 20px;
+  background: #1a73e8;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.chrome-mapping-save-btn:hover:not(:disabled) {
+  background: #1765cc;
+}
+
+.chrome-mapping-save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chrome-mapping-intro,
+  .chrome-mapping-loading,
+  .chrome-mapping-empty {
+    color: #999;
+  }
+
+  .chrome-mapping-table thead th {
+    background: #2a2a2e;
+    color: #aaa;
+    border-bottom-color: #3a3a3e;
+  }
+
+  .chrome-mapping-table tbody tr:nth-child(even) {
+    background: #232326;
+  }
+
+  .chrome-mapping-table td {
+    border-bottom-color: #333;
+  }
+}

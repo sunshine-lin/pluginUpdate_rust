@@ -80,7 +80,15 @@ interface SystemSnapshot {
   os_version: string;
 }
 
-type View = "update" | "logs" | "machine" | "patrol";
+type View = "update" | "logs" | "machine" | "patrol" | "chrome-mapping";
+
+/// Chrome Profile 映射表确认界面用的候选数据（DEV-125986）。
+/// 字段命名对齐后端 ChromeProfileCandidates（camelCase）
+interface ChromeProfileCandidates {
+  directoryNames: string[];
+  onlinePluginNames: string[];
+  savedMapping: Record<string, string>;
+}
 
 /// 机器状态页的刷新间隔：3 秒。CPU 占用率类数据需要能看出实时变化，
 /// 但采购同事的机器同时还在跑插件，间隔太短会增加不必要的采样开销
@@ -211,6 +219,14 @@ function App() {
 
   // 机器状态：CPU/内存/磁盘/系统版本，辅助判断虚拟机是否卡顿
   const [systemSnapshot, setSystemSnapshot] = useState<SystemSnapshot | null>(null);
+
+  // Chrome Profile 映射表确认（DEV-125986，独立进程架构专用）
+  const [chromeCandidates, setChromeCandidates] = useState<ChromeProfileCandidates | null>(null);
+  // 用户在界面上正在编辑的选择：目录名 -> 选中的 plugin_name（空字符串表示未选）。
+  // 打开页面时用 savedMapping 预填，避免每次都要重新选一遍
+  const [mappingDraft, setMappingDraft] = useState<Record<string, string>>({});
+  const [mappingHint, setMappingHint] = useState<string>("");
+  const [mappingSaving, setMappingSaving] = useState<boolean>(false);
 
   // 更新器自身的自动更新（区别于上面「更新 aichat 插件」的业务逻辑）
   const [selfUpdate, setSelfUpdate] = useState<SelfUpdateState>({ kind: "idle" });
@@ -526,6 +542,44 @@ function App() {
     return () => clearInterval(timer);
   }, [view]);
 
+  /// Chrome Profile 映射表确认页（DEV-125986）：进入页面时加载一次候选数据。
+  ///
+  /// 不轮询——这是人工一次性确认的操作，不像巡检看板那样需要看实时变化。
+  /// 每次进入页面重新拉取（而不是缓存），是因为候选（在线 plugin_name/
+  /// 当前 chrome.exe 进程）可能随时变化，进页面时应该看到当下最新状态。
+  useEffect(() => {
+    if (view !== "chrome-mapping") return;
+    setMappingHint("");
+    invoke<ChromeProfileCandidates>("get_chrome_profile_candidates")
+      .then((c) => {
+        setChromeCandidates(c);
+        setMappingDraft(c.savedMapping);
+      })
+      .catch((e) => setMappingHint(`读取候选数据失败: ${e}`));
+  }, [view]);
+
+  /// 保存人工在映射表确认界面里选定的对应关系。
+  ///
+  /// 提交前过滤掉未选择的行（空字符串）——避免把"用户还没决定"误存成
+  /// 一条无意义的空映射，那样下次查询时会因为找不到对应进程而误判成
+  /// "该实例 Chrome 未启动"。
+  async function saveChromeProfileMapping() {
+    setMappingSaving(true);
+    setMappingHint("正在保存…");
+    try {
+      const mapping: Record<string, string> = {};
+      for (const [dir, pluginName] of Object.entries(mappingDraft)) {
+        if (pluginName) mapping[dir] = pluginName;
+      }
+      const msg = await invoke<string>("save_chrome_profile_mapping_cmd", { mapping });
+      setMappingHint(msg);
+    } catch (e) {
+      setMappingHint(`保存失败：${e}`);
+    } finally {
+      setMappingSaving(false);
+    }
+  }
+
   /// 点 Chrome 工具栏上的插件图标（领导给的方案，走图像识别 + 模拟鼠标）。
   ///
   /// # 为什么要二次确认
@@ -775,6 +829,13 @@ function App() {
           onClick={() => setView("machine")}
         >
           机器状态
+        </button>
+        <button
+          className={`view-tab-btn ${view === "chrome-mapping" ? "view-tab-active" : ""}`}
+          onClick={() => setView("chrome-mapping")}
+          title="独立进程架构（各实例各自 --user-data-dir 启动）专用：确认目录名对应哪个插件实例，用于精确定位打开侧边栏"
+        >
+          实例映射
         </button>
         {/* 当前版本常驻显示：排查多台机器时不必再去翻日志 */}
         {appVersion && (
@@ -1213,6 +1274,73 @@ function App() {
               已确认不用（Chrome 强制 sidePanel.open() 由用户手势触发，
               自动拉起整条路走不通）。采购机无人值守，也没人需要点它。
               真要人工开侧边栏，远程桌面进去按 Ctrl+Shift+L 即可。 */}
+        </div>
+      ) : view === "chrome-mapping" ? (
+        <div className="chrome-mapping-view">
+          {/*
+            独立进程架构实例映射确认（DEV-125986）。
+
+            真机实测确认：这类架构下（各实例各自 --user-data-dir 启动），
+            目录名与 plugin_name 之间没有任何程序能读到的客观对应关系——
+            需要人工在这里做一次性选择确认，之后除非实例有变动才需要
+            重新配置。单进程多 Profile 架构（Profile 已命名）不需要这个
+            页面，走全自动的 UI Automation 识别。
+          */}
+          <p className="chrome-mapping-intro">
+            仅「每个插件实例各自用独立 Chrome 快捷方式（各自 --user-data-dir）启动」的机器需要配置。
+            为每个检测到的 Chrome 数据目录选择对应的插件实例，保存后「打开侧边栏」按钮才能精确点击到这个实例。
+          </p>
+          {mappingHint && <p className="chrome-mapping-hint">{mappingHint}</p>}
+          {!chromeCandidates ? (
+            <p className="chrome-mapping-loading">正在检测 Chrome 进程与在线实例…</p>
+          ) : chromeCandidates.directoryNames.length === 0 ? (
+            <p className="chrome-mapping-empty">
+              未检测到独立启动的 Chrome 进程（本机可能是单进程多 Profile 架构，不需要在这里配置）
+            </p>
+          ) : (
+            <>
+              <table className="chrome-mapping-table">
+                <thead>
+                  <tr>
+                    <th>Chrome 数据目录</th>
+                    <th>对应的插件实例</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {chromeCandidates.directoryNames.map((dir) => (
+                    <tr key={dir}>
+                      <td className="chrome-mapping-dir" title={dir}>
+                        {dir}
+                      </td>
+                      <td>
+                        <select
+                          value={mappingDraft[dir] ?? ""}
+                          onChange={(e) =>
+                            setMappingDraft((prev) => ({ ...prev, [dir]: e.target.value }))
+                          }
+                          disabled={mappingSaving}
+                        >
+                          <option value="">-- 未选择 --</option>
+                          {chromeCandidates.onlinePluginNames.map((name) => (
+                            <option key={name} value={name}>
+                              {name}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <button
+                className="chrome-mapping-save-btn"
+                onClick={saveChromeProfileMapping}
+                disabled={mappingSaving}
+              >
+                保存映射
+              </button>
+            </>
+          )}
         </div>
       ) : (
         <>
