@@ -1854,6 +1854,52 @@ pub fn find_hwnd_for_plugin_name(windows: &[(u64, String)], plugin_name: &str) -
         .map(|(hwnd, _)| *hwnd)
 }
 
+/// 构建枚举 chrome.exe 进程（含完整命令行）的 PowerShell 脚本。
+///
+/// 独立进程架构的识别入口：`Get-Process` 默认不返回命令行，必须用
+/// `Get-CimInstance Win32_Process`（WMI）才能读到 `--user-data-dir`。
+/// 输出契约每行 `<PID>|<CommandLine>`，交给
+/// [`parse_chrome_main_processes_output`] 解析。
+pub fn build_list_chrome_main_processes_script() -> String {
+    "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | \
+     ForEach-Object { Write-Output \"$($_.ProcessId)|$($_.CommandLine)\" }"
+        .to_string()
+}
+
+/// 解析 [`build_list_chrome_main_processes_script`] 的输出，得到
+/// (PID, user-data-dir 目录名) 列表。
+///
+/// 只保留：①主进程（[`is_chrome_main_process_command_line`]，排除渲染/
+/// GPU/网络等子进程——它们的 `--user-data-dir` 不代表独立实例）；
+/// ②确实带了 `--user-data-dir` 参数的记录（没带的对建映射没有意义，
+/// 跳过而非报错，容错优先）。
+pub fn parse_chrome_main_processes_output(output: &str) -> Vec<(u32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pid, command_line) = line.trim().split_once('|')?;
+            let pid: u32 = pid.trim().parse().ok()?;
+            if !is_chrome_main_process_command_line(command_line) {
+                return None;
+            }
+            let dir_name = extract_user_data_dir_name(command_line)?;
+            Some((pid, dir_name))
+        })
+        .collect()
+}
+
+/// 在 [`parse_chrome_main_processes_output`] 的结果中，按 `--user-data-dir`
+/// 目录名精确匹配对应的进程 PID。
+///
+/// 找不到时返回 `None`（比如映射表记录的实例，其 Chrome 当前还没启动），
+/// 调用方应据此提示「未找到对应进程」而不是误配到别的实例。
+pub fn find_pid_for_user_data_dir_name(processes: &[(u32, String)], dir_name: &str) -> Option<u32> {
+    processes
+        .iter()
+        .find(|(_, name)| name == dir_name)
+        .map(|(pid, _)| *pid)
+}
+
 #[tauri::command]
 fn send_plugin_command(plugin_name: String, kind: String) -> Result<String, String> {
     validate_plugin_command(&kind)?;
@@ -4148,6 +4194,80 @@ mod tests {
             None,
             "找不到对应窗口时应返回 None，不能误配到别的实例上——\
              那是比「点不到」更糟的「点错」"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 独立进程架构执行层（DEV-125986 第4步）：枚举 chrome.exe 命令行、
+    // 从中找出目标 --user-data-dir 目录名对应的主进程 PID。
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_list_chrome_main_processes_script_uses_cim_instance() {
+        let script = build_list_chrome_main_processes_script();
+        assert!(
+            script.contains("Win32_Process"),
+            "Get-Process 默认不返回命令行，必须用 CIM/WMI 才能读到 --user-data-dir"
+        );
+        assert!(
+            script.contains("chrome.exe"),
+            "只查 chrome.exe，不要把无关进程也扫进来"
+        );
+        assert!(
+            script.contains("ProcessId") && script.contains("CommandLine"),
+            "至少要带出 PID 和完整命令行，后续才能筛主进程、解析 user-data-dir"
+        );
+    }
+
+    #[test]
+    fn test_parse_chrome_main_processes_output_filters_subprocesses() {
+        // 输出契约：每行 "<PID>|<CommandLine>"。子进程（带 --type=）应被
+        // 过滤掉，不能把渲染进程的命令行也当成候选主进程
+        let output = concat!(
+            "7292|\"chrome.exe\" --user-data-dir=\"C:\\MyChromeData\\User4\" --flag-switches-begin\n",
+            "3564|\"chrome.exe\" --type=renderer --extension-process --lang=zh-CN\n",
+        );
+        let result = parse_chrome_main_processes_output(output);
+        assert_eq!(
+            result,
+            vec![(7292u32, "User4".to_string())],
+            "应只保留主进程那一行，并已解析出 user-data-dir 目录名"
+        );
+    }
+
+    #[test]
+    fn test_parse_chrome_main_processes_output_skips_lines_without_user_data_dir() {
+        // 主进程但没有 --user-data-dir 参数（如默认路径启动、未走独立
+        // 数据目录方案）时，这条记录对建映射没有意义，应跳过而非报错
+        let output = "7292|\"chrome.exe\" --flag-switches-begin --flag-switches-end\n";
+        assert_eq!(
+            parse_chrome_main_processes_output(output),
+            Vec::<(u32, String)>::new(),
+            "没有 --user-data-dir 的主进程不携带任何可用于识别的信息，应跳过"
+        );
+    }
+
+    #[test]
+    fn test_find_pid_for_user_data_dir_name_matches() {
+        let processes = vec![
+            (7292u32, "User4".to_string()),
+            (8113u32, "User5".to_string()),
+        ];
+        assert_eq!(
+            find_pid_for_user_data_dir_name(&processes, "User5"),
+            Some(8113u32),
+            "应按目录名精确匹配对应的 PID"
+        );
+    }
+
+    #[test]
+    fn test_find_pid_for_user_data_dir_name_not_found() {
+        let processes = vec![(7292u32, "User4".to_string())];
+        assert_eq!(
+            find_pid_for_user_data_dir_name(&processes, "User9"),
+            None,
+            "映射表指向的目录名如果当前没有对应的运行中进程（比如该实例\
+             Chrome 还没启动），应返回 None 而不是误配"
         );
     }
 }
