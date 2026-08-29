@@ -534,7 +534,13 @@ function App() {
   /// 跑着 8~10 个实例、插件正往供应商聊天框打字时，按键会落到别处或丢字。
   ///
   /// 所以点之前要让人确认「现在这台机器可以被打断」。
-  async function clickPluginIcon() {
+  ///
+  /// # 精确定位（DEV-125986）
+  /// 传入 `pluginName` 时，后端会按该实例定位到具体窗口做区域限定点击，
+  /// 不再无差别全屏找图标——巡检表格里"侧边栏未打开"那一行的按钮应传
+  /// 这个参数。不传（顶部兜底按钮）时后端在两条定位路径都失败时也会
+  /// 走这个全屏兜底逻辑，用于映射表未配置/UI Automation 用不了的场景。
+  async function clickPluginIcon(pluginName?: string) {
     const ok = window.confirm(
       "点插件图标会做两件有副作用的事：\n\n" +
         "1. 把 Chrome 窗口抢到最前（夺走焦点）\n" +
@@ -543,10 +549,15 @@ function App() {
         "按键可能落到别处。确认现在可以打断吗？",
     );
     if (!ok) return;
-    setSendingCmd("icon");
-    setPatrolHint("正在识别并点击插件图标…（约需 1~2 秒）");
+    const key = pluginName ? `icon:${pluginName}` : "icon";
+    setSendingCmd(key);
+    setPatrolHint(
+      pluginName
+        ? `正在识别并点击 ${pluginName} 的插件图标…（约需 1~2 秒）`
+        : "正在识别并点击插件图标…（约需 1~2 秒）",
+    );
     try {
-      const msg = await invoke<string>("click_plugin_icon");
+      const msg = await invoke<string>("click_plugin_icon", { pluginName: pluginName ?? null });
       setPatrolHint(msg);
     } catch (e) {
       // 失败原因对排查有用（没找到图标 = 可能要重截模板；没装 Python 等），
@@ -1003,22 +1014,18 @@ function App() {
             </span>
             {patrolHint && <span className="patrol-hint">{patrolHint}</span>}
             {/*
-              点插件图标（DEV-125034）。放在页面顶部而非每行，因为它与那四个
-              按钮性质不同：
-              - 那四个是**发指令给某个实例**，通过心跳通道，不影响别的实例
-              - 这个是**在这台机器上模拟真实鼠标点击**，整机级、会抢焦点
-
-              侧边栏关掉后无法由代码重开（Chrome 强制 sidePanel.open() 必须
-              用户手势），点图标是目前唯一可能自动化的路径。代价写在按钮上，
-              让点的人知道自己在做什么。
+              点插件图标兜底按钮（DEV-125034/DEV-125986）。放在页面顶部，
+              不带 pluginName——用于映射表未配置、或 UI Automation 用不了
+              的机器上，走原有全屏扫描逻辑。多数场景应优先用表格行内那个
+              "打开侧边栏"按钮（精确定位到具体实例，见 DEV-125986）。
             */}
             <button
               className="patrol-btn patrol-btn-danger patrol-icon-btn"
               disabled={sendingCmd !== null}
-              onClick={clickPluginIcon}
-              title="用图像识别找到 Chrome 工具栏上的插件图标并模拟鼠标点击，用于打开侧边栏。⚠️ 会把 Chrome 窗口抢到最前并移动鼠标，可能打断其它实例正在进行的聊天输入"
+              onClick={() => clickPluginIcon()}
+              title="用图像识别在整个屏幕上找插件图标并模拟鼠标点击（全屏兜底，不区分具体是哪个实例）。⚠️ 会把 Chrome 窗口抢到最前并移动鼠标，可能打断其它实例正在进行的聊天输入"
             >
-              点插件图标
+              点插件图标（全屏兜底）
             </button>
           </div>
           <div className="log-table-wrap">
@@ -1136,6 +1143,22 @@ function App() {
                         >
                           重载
                         </button>
+                        {/*
+                          打开侧边栏（DEV-125986）。只在侧边栏确实关闭时才显示——
+                          已打开时点它没有意义，还会误导人以为需要点一下。
+                          与顶部兜底按钮的区别：这里带上 pluginName，后端会精确
+                          定位到这一个实例的窗口再点击，不影响其它正常实例。
+                        */}
+                        {!it.sidepanelOpen && (
+                          <button
+                            className="patrol-btn patrol-btn-danger"
+                            disabled={sendingCmd !== null}
+                            onClick={() => clickPluginIcon(it.pluginName)}
+                            title={`用图像识别精确定位 ${it.pluginName} 的插件图标并点击，用于重新打开侧边栏。⚠️ 会把这个实例的 Chrome 窗口抢到最前并移动鼠标`}
+                          >
+                            打开侧边栏
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
